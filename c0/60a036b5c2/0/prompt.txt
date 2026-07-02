@@ -1,0 +1,71 @@
+<task-notification>
+<task-id>a1811b9334816d4e0</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a1811b9334816d4e0.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement checksum mode" completed</summary>
+<result>Everything is green. Here is a summary of all changes:
+
+---
+
+## Summary
+
+All changes confined to `internal/syncengine/*` and `internal/manifest/manifest.go` (+ its test file). No other files touched.
+
+### Diff hunk summary
+
+**`internal/manifest/manifest.go`** (+1 field)
+- `Sync` struct: added `Checksum bool \`toml:"checksum,omitempty"\``
+
+**`internal/syncengine/scan.go`** (~40 lines changed)
+- Added imports: `crypto/sha256`, `encoding/hex`, `io`
+- `Entry` struct: added `Hash string \`json:"hash,omitempty"\``
+- `ScanDir(root, excludes)` → `ScanDir(root, excludes, hashFiles bool)`: when `hashFiles=true`, computes streaming sha256 for every regular file and stores hex digest in `Entry.Hash`
+- Added `hashFile(path string) (string, error)` helper
+- `CmdScan`: added `--hash` bool flag, passes `*hashFiles` to `ScanDir`
+
+**`internal/syncengine/state.go`** (~3 lines changed)
+- `BaseEntry.Hash`: changed JSON tag from `json:"hash"` to `json:"hash,omitempty"` and updated the doc comment to describe its checksum-mode purpose
+
+**`internal/syncengine/remote.go`** (~10 lines changed)
+- `Scan(excludes)` → `Scan(excludes []string, hashFiles bool)`
+- `scanLocal(excludes)` → `scanLocal(excludes, hashFiles)`: passes through to `ScanDir`
+- `scanSSH(excludes, allowBootstrap)` → `scanSSH(excludes, hashFiles, allowBootstrap)`: appends ` --hash` to the remote command when `hashFiles=true`; all three recursive internal calls updated
+
+**`internal/syncengine/plan.go`** (~30 lines changed)
+- `Plan(base, local, remote)` → `Plan(base, local, remote, useHash bool)`
+- Added `fileModified(e Entry, bSize, bMtime int64, bHash string, useHash bool) bool` helper — uses hash inequality when `useHash &amp;&amp; e.Hash != "" &amp;&amp; bHash != ""`, else falls back to size/mtime
+- `localModified` / `remoteModified` now use `fileModified()`; dirs always use the non-hash path
+- In the "both new, no base" case: when `useHash &amp;&amp; !l.IsDir &amp;&amp; !r.IsDir &amp;&amp; l.Hash == r.Hash &amp;&amp; hashes non-empty` → `break` (no action)
+
+**`internal/syncengine/sync.go`** (~10 lines changed)
+- `runSyncEntry`: passes `s.Checksum` to `ScanDir`, `remote.Scan`, `Plan`, and the post-apply rescans
+- `buildBase`: stores `l.Hash` (or `r.Hash` as fallback) into `BaseEntry.Hash`
+
+**`internal/syncengine/plan_test.go`** (~80 lines added/changed)
+- All existing `Plan(...)` calls updated with `false` as 4th arg
+- 6 new hash-mode planner unit tests: `TestPlanHash_SameSizeMtimeDifferentHash`, `TestPlanHash_SameSizeMtimeSameHash`, `TestPlanHash_NoHashFallsBackToSizeMtime`, `TestPlanHash_BothNewSameHash_DifferentMtime`, `TestPlanHash_BlindSpot_WithoutChecksum`, `TestPlanHash_DirIgnoresHash`
+
+**`internal/syncengine/sync_test.go`** (~60 lines added/changed)
+- Two `ScanDir` calls updated with `false` as 3rd arg
+- Added `doSyncChecksum` helper
+- 3 new integration tests: `TestIntegration_Checksum_BlindSpot_WithoutChecksum` (proves the blind spot — same-size/mtime edit not propagated without checksum), `TestIntegration_Checksum_BlindSpot_WithChecksum` (proves it IS caught with checksum), `TestIntegration_Checksum_NormalEditsStillWork`
+
+**`internal/manifest/manifest_test.go`** (+25 lines)
+- `TestSyncChecksumRoundTrip`: verifies `Checksum: true` survives Save→Load, `Checksum: false` is omitted from TOML output via `omitempty`
+
+### Test output tail
+```
+ok  	caravan/internal/syncengine	0.487s
+ok  	caravan/internal/manifest	2.065s
+```
+All 2×count passes, both packages.
+
+### Deviations from spec
+None. All design points followed exactly, including: the `--hash` flag via `cliargs.ParseAnywhere`, the SSH transport appending ` --hash` after the path argument, the `fileModified` helper with hash-then-fallback logic, dirs always using size/mtime, the both-new same-hash shortcut, `buildBase` carrying local hash with remote fallback, and not touching daemon.go/lock.go or any files outside the permitted set.
+
+### Uncertainties
+- The SSH `--hash` flag is appended after the directory path in the remote command string (e.g. `~/.local/bin/caravan scan --json "~/root" --hash`). Since `cliargs.ParseAnywhere` accepts flags interleaved with positionals, the remote binary will handle this correctly.
+- The "both-new, same-hash, no-action" shortcut means the path never enters base until the next rescan finds it on both sides (the post-apply rescan intersection). This matches the spec's parenthetical note ("it will enter base on post-apply rescan intersection anyway").</result>
+<usage><subagent_tokens>84127</subagent_tokens><tool_uses>60</tool_uses><duration_ms>417990</duration_ms></usage>
+</task-notification>
