@@ -1,0 +1,41 @@
+<task-notification>
+<task-id>aeba2e846d6734ce9</task-id>
+<tool-use-id>toolu_01WUuu5YAwVk9SsxY1kL2HhP</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/aeba2e846d6734ce9.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement type-flip sync fix" completed</summary>
+<result>45/45 tests pass, including all 8 new type-conflict tests (7 planner unit tests + 3 integration tests). Here's a summary:
+
+---
+
+## What was done
+
+Files modified: `internal/syncengine/plan.go` and `internal/syncengine/sync.go`. Test files `plan_test.go` and `sync_test.go` were extended.
+
+### plan.go — key diff hunks
+
+**Line 12–20**: Added `OpPreDeleteLocal` and `OpPreDeleteRemote` constants before the existing ops.
+
+**Lines 71–129** (new, inserted before the existing `switch`): Type-conflict guard — `if hasLocal &amp;&amp; hasRemote &amp;&amp; l.IsDir != r.IsDir`. When triggered:
+- With base: compares `b.Dir != l.IsDir` / `b.Dir != r.IsDir` to determine which side flipped and wins.
+- Without base: `l.Mtime &gt;= r.Mtime` (tie → local).
+- Emits `OpPreDeleteRemote`+`OpMkdirRemote`/`OpPush` for local winner, or `OpPreDeleteLocal`+`OpMkdirLocal`/`OpPull` for remote winner. Both pre-delete actions carry `Conflict:true`.
+- `continue` skips the existing `switch`.
+
+**Lines 245–329** (child-action suppression pass): After the main loop, collects all pre-delete paths, then filters `actions` to drop children that would flow toward the losing side. Key rule: if winner is a FILE, suppress everything under the prefix (no children possible); if winner is a DIR, suppress only actions flowing toward the loser (pulls/mkdirLocal for OpPreDeleteRemote, pushes/mkdirRemote for OpPreDeleteLocal).
+
+**Lines 334–381** (`sortActions`): Priority updated to `preDelete=0 deepest-first`, `mkdir=1 shallow-first`, `push/pull=2`, `delete=3 deepest-first`.
+
+### sync.go — key diff hunks
+
+**`applyActions`**: Added `OpPreDeleteLocal` → `os.RemoveAll(localJoin(root, path))` and `OpPreDeleteRemote` → `remote.DeleteDir(path)`, executed inline (the slice is already sorted so they run before mkdirs/pushes). Both count in `stats.DeletedL`/`stats.DeletedR`. The conflict-winner detection also handles the new ops correctly.
+
+**`printPlan`/`opSide`**: New ops get `⚡` marker and `→remote`/`←local` side labels.
+
+### Tests added
+- 7 planner unit tests: local file→dir flip with base, local dir→file with base, remote flip with base, no-base newer local, no-base newer remote, no-base tie, child suppression (both directions — loser children suppressed, winner children survive).
+- 3 integration tests: `TestIntegration_TypeFlip_LocalFileToDir`, `TestIntegration_TypeFlip_LocalDirToFile`, `TestIntegration_TypeFlip_RemoteFileToDir`.
+
+### No deviations from spec.</result>
+<usage><subagent_tokens>57627</subagent_tokens><tool_uses>26</tool_uses><duration_ms>214300</duration_ms></usage>
+</task-notification>
