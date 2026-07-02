@@ -1,0 +1,112 @@
+<task-notification>
+<task-id>a1db052e5f98b81ee</task-id>
+<tool-use-id>toolu_014KxyeG7uVHVyxaeomY58UA</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a1db052e5f98b81ee.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement launchd daemon + lock" completed</summary>
+<result>Here is a complete summary of everything delivered.
+
+---
+
+## Files Created
+
+### 1. `internal/syncengine/lock.go` — 50 lines
+
+**Exported API:**
+```go
+var ErrSyncBusy = errors.New("sync already running for this entry")
+func AcquireSyncLock(name string) (release func(), err error)
+```
+
+Uses `resolvedStateDir()` (already in the package via state.go) to find the state dir, creates `&lt;StateDir&gt;/&lt;name&gt;.lock`, takes `syscall.LOCK_EX|LOCK_NB` flock. Each call opens a **fresh fd** so same-process tests get true exclusion. On EWOULDBLOCK returns `ErrSyncBusy`. `release()` unlocks and closes; lock file is left on disk.
+
+---
+
+### 2. `internal/syncengine/daemon.go` — 430 lines
+
+**Exported API (for wiring into main.go):**
+```go
+var LaunchAgentsDir = ""          // override in tests; defaults to ~/Library/LaunchAgents
+var launchctlRun = func(args ...string) ([]byte, error)  // stub in tests
+
+func CmdDaemon(args []string) int
+func launchdPlist(label, binPath, manifestPath, entry, interval, logPath string) string
+```
+
+Sub-commands: `install [NAME] [--interval 5s] [-f MANIFEST]`, `uninstall [NAME] [-f MANIFEST]`, `status [NAME] [-f MANIFEST]`. All guard `runtime.GOOS != "darwin"` → exit 1. Install: bootout if plist already exists (upgrade path), write plist, `launchctl bootstrap gui/&lt;uid&gt; &lt;plist&gt;`, fall back to `launchctl load` on "already"-containing error. Uninstall: bootout + os.Remove. Status: tabwriter table with plist-present, running (parsed from `launchctl print`), PID, last-sync from state JSON. Log files go to `~/Library/Logs/caravan/&lt;name&gt;.log` (mkdir-p'd on install).
+
+---
+
+### 3. `internal/syncengine/lock_test.go` — 59 lines
+
+Tests: `TestLock_AcquireReleaseAcquire` (first acquire succeeds, second fails with `ErrSyncBusy`, release, third succeeds), `TestLock_DifferentNames` (two entries don't block each other).
+
+### 4. `internal/syncengine/daemon_test.go` — 338 lines
+
+Tests: `TestPlist_WellFormedXML`, `TestPlist_ContainsLabel`, `TestPlist_ContainsKeepAlive`, `TestPlist_ArgsInOrder`, `TestPlist_LogPaths`, `TestPlist_RunAtLoad`, `TestDaemon_Install_WritesPlist`, `TestDaemon_Install_SingleEntry`, `TestDaemon_Uninstall_RemovesPlist`, `TestDaemon_Status_CallsPrint`, `TestDaemon_Install_UpgradePath`, `TestDaemon_Label`. All use `setupDaemonTest` which redirects `LaunchAgentsDir`+`StateDir` to temp dirs and replaces `launchctlRun` with a call recorder — no real launchctl is invoked.
+
+---
+
+## Sample plist output
+
+```xml
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+&lt;plist version="1.0"&gt;
+&lt;dict&gt;
+	&lt;key&gt;Label&lt;/key&gt;
+	&lt;string&gt;dev.caravan.sync.photos&lt;/string&gt;
+	&lt;key&gt;ProgramArguments&lt;/key&gt;
+	&lt;array&gt;
+		&lt;string&gt;/usr/local/bin/caravan&lt;/string&gt;
+		&lt;string&gt;sync&lt;/string&gt;
+		&lt;string&gt;--watch&lt;/string&gt;
+		&lt;string&gt;--interval&lt;/string&gt;
+		&lt;string&gt;5s&lt;/string&gt;
+		&lt;string&gt;-f&lt;/string&gt;
+		&lt;string&gt;/Users/alice/.config/caravan/caravan.toml&lt;/string&gt;
+		&lt;string&gt;photos&lt;/string&gt;
+	&lt;/array&gt;
+	&lt;key&gt;KeepAlive&lt;/key&gt;
+	&lt;true/&gt;
+	&lt;key&gt;RunAtLoad&lt;/key&gt;
+	&lt;true/&gt;
+	&lt;key&gt;StandardOutPath&lt;/key&gt;
+	&lt;string&gt;/Users/alice/Library/Logs/caravan/photos.log&lt;/string&gt;
+	&lt;key&gt;StandardErrorPath&lt;/key&gt;
+	&lt;string&gt;/Users/alice/Library/Logs/caravan/photos.log&lt;/string&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;
+```
+
+---
+
+## Build/Test Status
+
+**`go build ./internal/syncengine/...`** — PASSES cleanly (verified twice, including after waiting for the other agent's scan.go to settle).
+
+**`go test -count=2 -run 'Lock|Daemon|Plist' ./internal/syncengine/...`** — CANNOT compile the test binary yet because the **other agent's** concurrent edits left `plan_test.go` and `sync_test.go` with stale call sites for the new `Plan(..., bool)` and `ScanDir(..., bool)` signatures. These errors are on lines in files I don't own (plan_test.go:79/94/107, sync_test.go:356/384). My four files have zero compile errors. Once the other agent updates those test files the full `go test -run 'Lock|Daemon|Plist'` will run normally.
+
+---
+
+## Wiring instructions for main.go
+
+Add to the `switch` in `main()`:
+```go
+case "daemon":
+    code = syncengine.CmdDaemon(args)
+```
+
+And add `caravan daemon install|uninstall|status [NAME] ...` to the usage string.
+
+---
+
+## Deviations / Decisions
+
+- `launchdPlist` is unexported (lowercase) per Go convention for package-internal pure helpers; the spec said "make it a pure function and unit-test it" without requiring export. If the orchestrator needs it exported for cross-package testing, change to `LaunchdPlist`.
+- `StandardOutPath` and `StandardErrorPath` both point to the same log file (stdout+stderr merged) as specified.
+- The `launchctl load` fallback is triggered when the `bootstrap` call errors with output containing "already" (already loaded) — treated as success — OR any other error (falls back to `load`). The spec's "Bootstrap failed" wording is treated as the error message prefix from launchctl, but in practice the fallback fires on any bootstrap error that isn't already-loaded.
+- `runCommand` helper is a thin `exec.Command(...).CombinedOutput()` wrapper inlined in daemon.go to avoid polluting lock.go with an import.</result>
+<usage><subagent_tokens>56459</subagent_tokens><tool_uses>35</tool_uses><duration_ms>261282</duration_ms></usage>
+</task-notification>
