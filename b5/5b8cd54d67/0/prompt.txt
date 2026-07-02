@@ -1,0 +1,40 @@
+<task-notification>
+<task-id>afdb2d6a7fa294178</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/afdb2d6a7fa294178.output</output-file>
+<status>completed</status>
+<summary>Agent "Docker sandbox recipe" completed</summary>
+<result>Everything is in order. Here is the concise report:
+
+---
+
+**Files created**
+
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/Dockerfile` — multi-stage: `golang:1.24-bookworm` builder (CGO_ENABLED=0, trimpath) → `debian:bookworm-slim` runtime with git + ca-certificates; caravan binary at `/usr/local/bin/caravan`; manifest baked at `/root/.config/caravan/caravan.toml`; `ENTRYPOINT ["/usr/local/bin/caravan", "up"]`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/caravan.toml` — two public repos into `/root/code`: `octocat/Hello-World` (branch master) and `octocat/Spoon-Knife`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/devcontainer.json` — builds from the same Dockerfile with `overrideCommand: true` and `"postCreateCommand": "caravan up"`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/README.md` — build/run instructions, age-key injection options, timing
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/.dockerignore` — excludes the mac binary (`caravan`), `.git`, `*.test`, `.DS_Store` from build context
+
+**Docker commands run**
+
+```
+docker build -f sandbox/Dockerfile -t caravan-sandbox:test .   # ~23s
+docker run --rm caravan-sandbox:test                            # cold-start provision
+docker run --rm --entrypoint /bin/bash caravan-sandbox:test \
+  -c "caravan up &amp;&amp; ls /root/code &amp;&amp; ..."                       # workspace verification
+docker rmi caravan-sandbox:test                                 # cleanup
+```
+
+**Results**
+
+- Image size: **282 MB** (slim base + git + 8 MB static binary)
+- `caravan up` provision time (reported by caravan): **795 ms**
+- `docker run` wall time (container startup + provision): **~1.3 s**
+- Both repos cloned and populated: `hello-world/README`, `spoon-knife/README.md index.html styles.css`
+
+**Age key injection**: recommended approach is a runtime bind-mount (`-v age.key:/root/.config/caravan/age.key:ro`) so the key never touches image layers. Build-secret alternative is documented in both the Dockerfile comments and the README. The test manifest needs no secrets.
+
+**Uncertainties**: The 282 MB image is dominated by git and its perl/openssl/kerberos dependency chain pulled in by `debian:bookworm-slim`. A future optimisation could use `alpine` with `apk add git` (~70 MB total), but would need to verify git's https credential stack works identically. The current recipe is conservative and correct.</result>
+<usage><subagent_tokens>42995</subagent_tokens><tool_uses>25</tool_uses><duration_ms>171708</duration_ms></usage>
+</task-notification>
