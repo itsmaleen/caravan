@@ -5,7 +5,8 @@
 #   CARAVAN_BIN=$(pwd)/caravan ./test/chaos-sync.sh
 set -u
 
-MINI="${CARAVAN_TEST_REMOTE:-user@example-host}"
+MINI="${CARAVAN_TEST_REMOTE:-}"
+[ -n "$MINI" ] || { echo "usage: set CARAVAN_TEST_REMOTE=user@host (ssh target for the test remote)"; exit 2; }
 LOCAL_DIR="$HOME/caravan-chaos-sync"
 REMOTE_DIR="caravan-chaos-sync"
 BIN="${CARAVAN_BIN:-$(pwd)/caravan}"

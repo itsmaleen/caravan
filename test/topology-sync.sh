@@ -12,7 +12,8 @@
 # losers backed up on the losing side).
 set -u
 
-MINI="${CARAVAN_TEST_REMOTE:-user@example-host}"
+MINI="${CARAVAN_TEST_REMOTE:-}"
+[ -n "$MINI" ] || { echo "usage: set CARAVAN_TEST_REMOTE=user@host (ssh target for the test remote)"; exit 2; }
 BIN="${CARAVAN_BIN:-$(pwd)/caravan}"
 A="$HOME/caravan-topo-A"
 MAN_A="$(mktemp -d)/caravan.toml"
@@ -50,13 +51,15 @@ remote = "$MINI:~/caravan-topo-hub"
 EOF
 
 # Mini-side manifest: append the hub<->B entry if not present.
-on_mini 'grep -q caravan-topo-B ~/.config/caravan/caravan.toml 2>/dev/null || cat >> ~/.config/caravan/caravan.toml <<EOF
+# (local: transport needs an absolute path; derive the remote home at runtime)
+RHOME="$(on_mini 'echo $HOME')"
+on_mini "grep -q caravan-topo-B ~/.config/caravan/caravan.toml 2>/dev/null || cat >> ~/.config/caravan/caravan.toml <<EOF
 
 [[sync]]
-name   = "topo-B"
-local  = "~/caravan-topo-hub"
-remote = "local:/Users/exampleuser/caravan-topo-B"
-EOF'
+name   = \"topo-B\"
+local  = \"~/caravan-topo-hub\"
+remote = \"local:$RHOME/caravan-topo-B\"
+EOF"
 
 echo "== start hub<->B daemon on the mini =="
 on_mini '~/.local/bin/caravan daemon install topo-B --interval 1s' && ok "daemon installed on mini" || bad "daemon install on mini"
@@ -103,10 +106,10 @@ rm -rf "$A" "$HOME/.config/caravan/sync-state/topo-A.json"
 on_mini 'rm -rf caravan-topo-hub caravan-topo-B ~/.config/caravan/sync-state/topo-B.json'
 # strip the topo-B entry from the mini manifest again
 on_mini 'python3 - <<PYEOF
-import re
-p = "/Users/exampleuser/.config/caravan/caravan.toml"
+import os, re
+p = os.path.expanduser("~/.config/caravan/caravan.toml")
 s = open(p).read()
-s = re.sub(r"\n*\[\[sync\]\]\nname   = \"topo-B\"\nlocal  = \"~/caravan-topo-hub\"\nremote = \"local:/Users/exampleuser/caravan-topo-B\"\n?", "\n", s)
+s = re.sub(r"\n*\[\[sync\]\]\nname   = \"topo-B\"\nlocal  = \"~/caravan-topo-hub\"\nremote = \"local:[^\"]*caravan-topo-B\"\n?", "\n", s)
 open(p, "w").write(s)
 PYEOF'
 

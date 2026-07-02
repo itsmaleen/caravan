@@ -5,7 +5,8 @@
 # after each mutation round.
 set -u
 
-MINI="${CARAVAN_TEST_REMOTE:-user@example-host}"
+MINI="${CARAVAN_TEST_REMOTE:-}"
+[ -n "$MINI" ] || { echo "usage: set CARAVAN_TEST_REMOTE=user@host (ssh target for the test remote)"; exit 2; }
 LOCAL_DIR="$HOME/caravan-test-sync"
 REMOTE_DIR='caravan-test-sync'   # relative to remote $HOME
 BIN="${CARAVAN_BIN:-$(pwd)/caravan}"

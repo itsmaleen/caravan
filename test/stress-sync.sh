@@ -2,7 +2,8 @@
 # Caravan sync stress test: 1000 small files + a few binary blobs, cross-device.
 # Measures initial push, no-op scan, and incremental single-file propagation.
 set -u
-MINI="${CARAVAN_TEST_REMOTE:-user@example-host}"
+MINI="${CARAVAN_TEST_REMOTE:-}"
+[ -n "$MINI" ] || { echo "usage: set CARAVAN_TEST_REMOTE=user@host (ssh target for the test remote)"; exit 2; }
 BIN="${CARAVAN_BIN:-$(pwd)/caravan}"
 LOCAL_DIR="$HOME/caravan-stress-sync"
 MANIFEST="$(mktemp -d)/caravan.toml"
