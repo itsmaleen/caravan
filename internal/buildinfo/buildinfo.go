@@ -2,4 +2,4 @@
 package buildinfo
 
 // Version is the current caravan release version.
-const Version = "0.5.1"
+const Version = "0.6.0"

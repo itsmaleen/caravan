@@ -35,6 +35,25 @@ hosted release once one exists. See `scripts/install.sh` header for details.
 **Homebrew:** coming once the project has a public GitHub home.
 See `packaging/homebrew/caravan.rb` for the formula template and instructions.
 
+## Setup wizard
+
+New to caravan? Let an AI coding agent walk you through configuration:
+
+```
+caravan setup
+```
+
+`caravan setup` detects an AI agent already installed on your machine (Claude
+Code, Gemini CLI, Codex, opencode, or cursor-agent), gathers machine context
+(OS, hostname, manifest path, `caravan doctor` output, tool inventory), and
+hands the agent a crafted prompt so it interviews you and drives every command
+— from `caravan init` through `caravan doctor` all-green. Inference runs on
+your existing subscription; it costs the caravan project nothing.
+
+Flags: `--agent NAME` (force a specific agent), `--headless` (non-interactive
+one-shot), `--print-prompt` (print the assembled prompt and exit — paste into
+any chat UI, or use to debug context gathering).
+
 ## Manifest
 
 Resolution order: `-f` flag > `$CARAVAN_MANIFEST` > `~/.config/caravan/caravan.toml`.
