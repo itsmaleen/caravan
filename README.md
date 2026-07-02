@@ -120,9 +120,11 @@ preserved).
 ## Testing
 
 ```
-go test ./...                                    # unit/integration tests
-CARAVAN_BIN=$(pwd)/caravan ./test/e2e-sync.sh    # cross-device e2e (needs ssh to the mini)
-CARAVAN_BIN=$(pwd)/caravan ./test/stress-sync.sh # 1000-file cross-device stress/perf
+go test ./...                                      # unit/integration tests
+CARAVAN_BIN=$(pwd)/caravan ./test/e2e-sync.sh      # cross-device e2e (needs ssh to the mini)
+CARAVAN_BIN=$(pwd)/caravan ./test/edge-sync.sh     # 10-round edge-case probe (unicode, type flips, …)
+CARAVAN_BIN=$(pwd)/caravan ./test/stress-sync.sh   # 1000-file cross-device stress/perf
+CARAVAN_BIN=$(pwd)/caravan ./test/topology-sync.sh # 3-replica hub-and-spoke across both machines
 ```
 
 The e2e script exercises the real two-machine loop: initial push, edits in both
@@ -131,9 +133,11 @@ orientations, asserting sha256 tree parity after every round.
 
 ## Status / roadmap
 
-v0.1.1 = Tier 0 provisioning + Tier 1 folder sync from PLAN.md, validated
-across a MacBook ↔ Mac mini pair, plus the agent-sandbox recipe (`sandbox/` —
-a container cold-starts with the workspace provisioned in ~1.3 s). Flags may
-appear anywhere in the arg list. Not built (deliberately): FUSE/VFS anything,
-conflict UI, delta transfer, daemonization beyond `--watch`. See `../PLAN.md`
-for tiers and kill criteria.
+v0.5.0: Tier 0 provisioning + Tier 1 sync from PLAN.md fully built and
+validated across a MacBook ↔ Mac mini pair — provisioning (partial clones,
+age secrets, mise/direnv), agent-sandbox recipe (~1.3 s container cold start),
+bidirectional sync with self-updating remotes, checksum mode, chmod
+propagation, conflict-loser backups, rsync delta transfer, launchd daemon,
+hub-and-spoke topologies, `doctor` diagnostics, and release tooling.
+Deliberately not built (Tier 2+, see `../PLAN.md`): FUSE/VFS anything,
+conflict UI, block-level custom delta, non-macOS daemons.
