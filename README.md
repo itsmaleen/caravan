@@ -20,7 +20,7 @@ caravan doctor        # diagnose environment, repos, sync pairs, secrets
 
 **Build from source (recommended for now):**
 ```
-git clone <this-repo> && cd caravan
+git clone git@github.com:itsmaleen/caravan.git && cd caravan
 make build          # outputs ./caravan
 ```
 
