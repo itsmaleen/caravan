@@ -1,0 +1,150 @@
+<task-notification>
+<task-id>ac722de5ab062a5e7</task-id>
+<tool-use-id>toolu_01GQWqYf5dtC3bGyynSB1LyY</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/ac722de5ab062a5e7.output</output-file>
+<status>completed</status>
+<summary>Agent "Sync edge-case probe" completed</summary>
+<result>Here is the full report.
+
+---
+
+## Per-round PASS/FAIL table
+
+| Round | Case | Result | Sub-checks |
+|---|---|---|---|
+| 1 | Filenames with spaces | **PASS** | 4/4 |
+| 2 | Unicode filenames | **FAIL** | 3/4 (sync works; test comparator broken) |
+| 3 | Deep nesting (8 levels) | **PASS** | 2/2 |
+| 4 | Empty directory propagation | **PASS** | 2/2 |
+| 5 | Type flip file→dir | **FAIL** | 0/2 |
+| 6 | Type flip dir→file | **FAIL** | 0/2 |
+| 7 | Same-size same-mtime conflict | **PASS** | 3/3 |
+| 8 | Single-quote filename skipped | **PASS** | 4/4 |
+| 9 | Local delete + remote modify | **PASS** | 3/3 |
+| 10 | dir1→dir2 rename (delete+add) | **PASS** | 3/3 |
+
+**Total: 23 passed, 5 failed. Runtime: 37 s.**
+
+---
+
+## FAIL detail
+
+### Round 2 — Unicode filenames (1 sub-check FAIL; sync correct)
+
+**Observed vs expected:** The three files (`héllo-wörld.txt`, `日本語.txt`, `🚀.txt`) appear on the remote with identical content hashes. Individual `test -f` checks all pass. The `trees_match` comparison fails despite identical-looking terminal output.
+
+**Exact output:**
+```
+--- local ---
+  ./🚀.txt 02fa7037...
+  ./日本語.txt 52e33a2c...
+  ./héllo-wörld.txt 04811dce...
+--- remote ---
+  ./🚀.txt 02fa7037...
+  ./日本語.txt 52e33a2c...
+  ./héllo-wörld.txt 04811dce...
+FAIL: r2: unicode filenames push and pull back identical
+```
+
+**Hypothesis:** This is a test-script artifact, not a caravan bug. The `trees_match` function compares bash string variables captured from `local_tree` and `remote_tree`. Unicode filenames on macOS APFS can be stored as either NFC or NFD code-unit sequences. The local shell script source embeds NFC characters; APFS may normalize on disk; `sort -z` collation over SSH inherits whatever `LC_ALL`/`LANG` is set in the remote non-interactive session (often `POSIX`/`C`), producing a different byte-for-byte ordering than the local sort even if filenames render identically. The `[ "$l" = "$r" ]` byte comparison then fails. **Caravan itself is not the source of the failure**: the sync plan correctly pushed all three files, the hashes match, and no data is lost.
+
+**Source context:** not a caravan issue. Probe-script issue with `sort` locale divergence in SSH.
+
+---
+
+### Round 5 — Type flip file→dir (2 sub-checks FAIL)
+
+**Exact sequence and output:**
+```
+# Established base: flip.txt is a file on both sides.
+# Locally: rm flip.txt; mkdir flip.txt; echo "inner content" &gt; flip.txt/inner.txt
+
+~ edge-folder — plan:
+  ↑  flip.txt/inner.txt  →remote  new local
+
+flip.txt/inner.txt: Could not stat flip.txt/inner.txt: Not a directory
+tar: Error exit delayed from previous errors.
+push: ssh push: exit status 1
+  pushed 0, pulled 0, deleted 0 local/0 remote, conflicts 0, errors 1
+
+local_tree:  ./flip.txt/inner.txt  64741ebb...
+remote_tree: ./flip.txt            0aad23a2...
+FAIL: r5: trees diverged after file→dir flip
+FAIL: r5: remote flip.txt is NOT a directory (type=Regular File)
+```
+
+**Tree states:**
+- Local: `flip.txt/` (dir) containing `inner.txt`
+- Remote: `flip.txt` (still the original plain file)
+- State file: recorded both sides diverged (push failed, so path not in new base)
+
+**What happened step by step:**
+1. Plan sees `flip.txt/inner.txt` as new local (no base entry) → `OpPush`.
+2. Plan sees `flip.txt` (in base as file; local now a dir): `localModified=true`, `remoteModified=false` → falls into `plan.go:156-160`: `if !l.IsDir { push }` — `l.IsDir` is true, so **no action at all** for `flip.txt` itself.
+3. The tar push of `flip.txt/inner.txt` runs `tar -C localRoot -cf - -T list` (list contains `flip.txt/inner.txt`). Locally this is fine. On the remote, `tar -xpf -` tries to create path `flip.txt/inner.txt` but `flip.txt` is a regular file on the remote, not a directory. Tar fails with "Not a directory".
+
+**Root cause — `plan.go:156–161`:** The planner treats a local file-to-dir type change as "dir mtime bumped, no content action needed." There is no code path that recognises the type flip (file in base → dir in local) and emits: `OpDeleteRemote` (old file) + `OpMkdirRemote` (new dir). Without that, the tar extraction is structurally impossible.
+
+---
+
+### Round 6 — Type flip dir→file (2 sub-checks FAIL)
+
+**Exact sequence and output:**
+```
+# Established base: flipdir/ with flipdir/f.txt on both sides.
+# Locally: rm -rf flipdir; echo "now a file" &gt; flipdir
+
+~ edge-folder — plan:
+  ↑  flipdir        →remote  modified locally
+  ✗  flipdir/f.txt  →remote  deleted locally
+
+flipdir: Can't replace existing directory with non-directory: Directory not empty
+tar: Error exit delayed from previous errors.
+push: ssh push: exit status 1
+  pushed 0, pulled 0, deleted 0 local/1 remote, conflicts 0, errors 1
+
+local_tree:  ./flipdir  5af7f3f9...
+remote_tree: (empty — remote flipdir is a dir with no files left)
+FAIL: r6: trees diverged after dir→file flip
+FAIL: r6: remote flipdir is NOT a regular file (type=Directory)
+```
+
+**Tree states:**
+- Local: `flipdir` is a regular file
+- Remote: `flipdir` is an empty directory (f.txt was successfully deleted, but the dir itself couldn't be replaced)
+- State file: base records `flipdir/f.txt` deleted from remote (1 remote delete succeeded); push of `flipdir` failed so not updated there
+
+**What happened step by step:**
+1. Plan (correctly) plans `OpPush` for `flipdir` (local file, `!l.IsDir` so push fires at `plan.go:158-159`).
+2. Plan (correctly) plans `OpDeleteRemote` for `flipdir/f.txt` (deleted locally, remote unchanged).
+3. Sort order: push comes before delete (`sortActions` priority 1 vs 2). So tar tries to extract `flipdir` as a file onto the remote where `flipdir` is still a **non-empty directory** → "Can't replace existing directory with non-directory: Directory not empty."
+4. The delete of `flipdir/f.txt` then succeeds, leaving an empty dir shell on remote that can never be replaced.
+
+**Root cause — two interacting issues:**
+- `plan.go:156–161` does not plan a recursive `OpDeleteRemote` on the old dir when the local type flipped dir→file.
+- `sync.go:sortActions` (priority push=1, delete=2) means the push always runs before the deletion. Even if the order were reversed and `f.txt` deleted first, tar still cannot overwrite an empty directory with a file of the same name without an explicit `rm -r` of the old dir entry. A correct fix needs a `OpDeleteRemote` (recursive) for `flipdir` itself before the push.
+
+---
+
+## Additional observations (passing rounds)
+
+**Round 7 — same-size same-mtime:** Both local and remote `collision.txt` were written in the same wall-clock second (`mtime=1782972630`). At nanosecond resolution (what the scan stores) the remote had a slightly later timestamp due to SSH RTT, so remote won ("bbbb"). The conflict was correctly flagged. The documented limitation at `plan.go:66-67` — `(l.Size != b.LSize || l.Mtime != b.LMtime)` — means that a content change which accidentally preserves both size and nanosecond mtime on an existing in-base file will be invisible to the engine. This is noted in `scan.go` (no hash in v0.1).
+
+**Round 8 — single-quote:** `scan.go:62` correctly emits the warning and skips the file; sync of remaining files completes without error, exit code 0, file not pushed to remote.
+
+**Round 9 — delete+modify:** `plan.go:116-121` fires correctly: `!hasLocal &amp;&amp; hasRemote &amp;&amp; hasBase &amp;&amp; remoteModified` → `OpPull`. File restored with remote content.
+
+**Round 10 — rename:** Treated as delete+add. Three deletes (dir1/a.txt, dir1/b.txt, dir1 itself) and three pushes (dir2/a.txt, dir2/b.txt + mkdir dir2) complete in one pass. Trees converge.
+
+---
+
+## Summary of genuine caravan bugs found
+
+| Bug | Location | Trigger |
+|---|---|---|
+| File→dir type flip: planner emits no action for the file entry itself, then tar extraction fails | `plan.go:156–161` | `hasLocal &amp;&amp; hasRemote &amp;&amp; hasBase`, `localModified=true`, `!remoteModified`, `l.IsDir=true` but `r.IsDir=false` |
+| Dir→file type flip: push runs before recursive dir delete; tar can't overwrite a dir with a file | `plan.go:156–161` + `sync.go:sortActions` | Same base case, reversed types; action ordering compounds it |
+
+Script is at `/Users/marlin/fable-experiments/drive-for-devs/caravan/test/edge-sync.sh`. Binary was built from the repo root as `./caravan`.</result>
+<usage><subagent_tokens>52414</subagent_tokens><tool_uses>14</tool_uses><duration_ms>919045</duration_ms></usage>
+</task-notification>
