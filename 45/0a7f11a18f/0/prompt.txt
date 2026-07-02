@@ -1,0 +1,49 @@
+<task-notification>
+<task-id>a95fa52fb5c3f911f</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a95fa52fb5c3f911f.output</output-file>
+<status>completed</status>
+<summary>Agent "Release tooling" completed</summary>
+<result>Everything is in place. Here is a summary of what was delivered:
+
+---
+
+## What was done
+
+### Files created
+
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/Makefile` — `build`, `test`, `release`, `clean` targets with `.PHONY`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/scripts/release.sh` — cross-platform release builder (4 targets, checksums, summary table)
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/scripts/install.sh` — curl-pipe-safe installer; local `dist/` mode by default, `--url`/`$CARAVAN_BASE_URL` for hosted releases
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/packaging/homebrew/caravan.rb` — Formula template with `REPLACE_ME` placeholders and a detailed comment block
+
+### Existing files edited
+
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/.gitignore` — appended `dist/`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/README.md` — inserted "Install" section after the command block (10 lines, matching README tone)
+
+### Release summary (repo root, v0.2.0)
+
+| artifact | size |
+|---|---|
+| caravan-0.2.0-darwin-arm64.tar.gz | 1,562,135 B (~1.5 MB) |
+| caravan-0.2.0-darwin-amd64.tar.gz | 1,687,131 B (~1.6 MB) |
+| caravan-0.2.0-linux-arm64.tar.gz | 1,534,315 B (~1.5 MB) |
+| caravan-0.2.0-linux-amd64.tar.gz | 1,692,660 B (~1.6 MB) |
+
+All 4 SHA-256 checksums verified OK. `dist/` is gitignored and left in place.
+
+### Verification results
+
+- `bash -n scripts/release.sh` and `bash -n scripts/install.sh` — both pass
+- `make build` — clean build from HEAD in isolated worktree
+- `make release` — full 4-platform build + checksums, both in worktree and repo root
+- `bash scripts/install.sh` — copied darwin/arm64 tarball to `~/.local/bin/caravan`; `caravan version` printed `caravan 0.2.0`
+
+### Deviations / notes
+
+- Version (`0.2.0`) is extracted from `internal/buildinfo/buildinfo.go` at release-script runtime via `grep`/`sed`, so bumping that constant is the only change needed for future releases.
+- The Homebrew formula builds from source (not from pre-built tarballs) because there is no hosted binary URL yet; the formula will need updating once a GitHub release with a source tarball exists.
+- `install.sh` requires `CARAVAN_VERSION` env var when curl-piped (since source isn't available to grep); documented in the script header.</result>
+<usage><subagent_tokens>22268</subagent_tokens><tool_uses>26</tool_uses><duration_ms>169404</duration_ms></usage>
+</task-notification>
