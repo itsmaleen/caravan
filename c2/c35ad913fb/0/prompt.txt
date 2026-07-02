@@ -1,0 +1,54 @@
+<task-notification>
+<task-id>a0f5ab0c832eea330</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a0f5ab0c832eea330.output</output-file>
+<status>completed</status>
+<summary>Agent "CLI robustness improvements" completed</summary>
+<result>All five packages green. Here is a concise summary of everything done:
+
+---
+
+## Summary
+
+### Files created
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/buildinfo/buildinfo.go` — `const Version = "0.1.1"`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/cliargs/cliargs.go` — `ParseAnywhere(*flag.FlagSet, []string) ([]string, error)`
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/cliargs/cliargs_test.go` — 8 tests (flags before/after/interleaved, `=`-form, `--` terminator, no-args, flags-only, unknown-flag)
+
+### Files changed
+
+**Change 1 — version bump:**
+- `main.go` lines 5–12, 51: removed `const version = "0.1.0"`, imported `buildinfo`, uses `buildinfo.Version`
+
+**Change 2 — remote version handshake:**
+- `internal/syncengine/scan.go` line 27–28: `ScanResult` gains `Version string json:"version,omitempty"`; line 153: `CmdScan` populates it with `buildinfo.Version`; also switched to `ParseAnywhere`
+- `internal/syncengine/remote.go` lines 110–130: after successful `json.Unmarshal`, checks `result.Version != buildinfo.Version`; prints note, calls `bootstrap()`, rescans once with `allowBootstrap=false`; empty Version treated as `"pre-0.1.1"`
+
+**Change 3 — flags anywhere:**
+- `internal/syncengine/sync.go`: `ParseAnywhere` replaces `fs.Parse`; `fs.NArg()/fs.Arg(0)` → `len(positionals)/positionals[0]`
+- `internal/manifest/init.go`: same swap (no positionals used, `_` discards slice)
+- `internal/provision/up.go`: same swap
+- `internal/provision/status.go`: same swap
+- `internal/secrets/secrets.go`: all four subcommand parsers (`init`, `set`, `show`, `add-machine`) use `ParseAnywhere`; `set`/`show`/`add-machine` replace `pos := fs.Args()` with the returned slice
+
+**Change 4 — apply secrets even on pull failure:**
+- `internal/provision/up.go` `processRepo`: removed early `return` on pull failure; secrets/.env/direnv block now runs regardless; on failure with `envWritten`, appends `"; .env written"` to detail; mise step stays guarded behind `if failed` exit
+- `internal/provision/provision_test.go`: added `makeDivergedRepo` helper + `TestCmdUpPullFailReported` + `TestCmdUpPullFailEnvStillWritten` (uses real age encryption via `secrets.CmdSecrets`)
+
+### Test output tail
+All 5 packages green, `count=2` run: `cliargs`, `manifest`, `provision`, `secrets`, `syncengine` all `ok`.
+
+### Manual smoke
+```
+$ /tmp/caravan-test sync somename -f /nonexistent/path.toml
+sync: loading manifest /nonexistent/path.toml: open /nonexistent/path.toml: no such file or directory
+exit: 1
+```
+Confirms the `-f` flag is parsed even after the positional `somename` — it references `/nonexistent/path.toml` (not the default `~/.config/caravan/caravan.toml`).
+
+### Deviations / notes
+- `--` terminator: naturally works — `flag.Parse` consumes `--` and returns everything after it as args, which `ParseAnywhere` then collects as positionals. No special handling needed; documented in the package comment.
+- Version mismatch on second scan (after bootstrap): prints "still mismatched after bootstrap; proceeding" warning and returns the entries — this avoids infinite recursion while still being informative.
+- `cmdSecretsInit` has no positionals; uses `_, err :=` form.</result>
+<usage><subagent_tokens>100268</subagent_tokens><tool_uses>57</tool_uses><duration_ms>655484</duration_ms></usage>
+</task-notification>
