@@ -10,7 +10,7 @@ caravan init          # walk ~/code, discover git repos, draft caravan.toml
 caravan up            # clone/pull every repo, decrypt secrets → .env, mise install
 caravan status        # branch, ahead/behind, dirty, .env, toolchain per repo
 caravan sync          # bidirectional folder sync to another machine over ssh
-caravan sync --watch  # continuous sync (polling, foreground)
+caravan sync --watch  # continuous sync: ~1s reaction to changes on either side
 caravan daemon ...    # install | uninstall | status — sync as a launchd service
 caravan secrets ...   # init | set | show | add-machine
 ```
@@ -96,8 +96,15 @@ remote's `~/.local/bin` automatically — a fresh machine needs nothing but ssh
 access. A version handshake on every scan re-pushes the binary whenever the
 remote is stale, so remotes never drift after the first bootstrap.
 
+Every ssh call is multiplexed (ControlMaster, 60s persist), so a warm no-op
+scan costs ~50 ms. Watch mode pairs a 1s local poll with a remote long-poll
+(`scan --wait`): the remote caravan holds the connection open and returns the
+moment its side changes, so either side's edits propagate in about a second
+without per-tick scan traffic.
+
 Measured (MacBook ↔ Mac mini over Tailscale): 1003 files / ~15 MB initial push
-in ~9 s, no-op scan 0.4 s, single-file incremental ~1 s.
+in ~9 s, warm no-op sync 0.05 s, watch-mode propagation 0.6–1.2 s either
+direction.
 
 ## Secrets
 

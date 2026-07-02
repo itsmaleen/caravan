@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/text/unicode/norm"
 
@@ -152,13 +153,66 @@ func matchesExclude(rel string, excludes []string) bool {
 	return false
 }
 
-// CmdScan implements `caravan scan --json DIR [--exclude a,b,c] [--hash]`.
+// entriesEqual reports whether two entry maps are identical: same keys, same
+// Entry values. It is used by waitForChange to detect a mutation.
+func entriesEqual(a, b map[string]Entry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, ea := range a {
+		eb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if ea != eb {
+			return false
+		}
+	}
+	return true
+}
+
+// waitForChange takes an initial ScanDir snapshot of root and then polls every
+// poll duration until either the snapshot changes (returns early with
+// changed=true) or window elapses (returns the current snapshot with
+// changed=false). It always returns the final entries and whether a change was
+// detected.
+func waitForChange(root string, excludes []string, hashFiles bool, window, poll time.Duration) (map[string]Entry, bool) {
+	initial, _, err := ScanDir(root, excludes, hashFiles)
+	if err != nil {
+		// Treat scan failure as a change so the caller triggers a sync pass.
+		return initial, true
+	}
+
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		time.Sleep(poll)
+		current, _, err := ScanDir(root, excludes, hashFiles)
+		if err != nil {
+			return current, true
+		}
+		if !entriesEqual(initial, current) {
+			return current, true
+		}
+	}
+	// Final scan at window end.
+	final, _, _ := ScanDir(root, excludes, hashFiles)
+	return final, false
+}
+
+// CmdScan implements `caravan scan --json DIR [--exclude a,b,c] [--hash] [--wait <dur>]`.
+// With --wait the command long-polls for a change in DIR for up to <dur>; if a
+// change is detected it emits the new snapshot immediately and exits 0.  If no
+// change is seen within <dur> it emits the current snapshot and exits 0.
+// Either way it prints "changed=true" or "changed=false" to STDERR so callers
+// (WaitScan) can distinguish the two outcomes without exit-code gymnastics.
+// Without --wait behaviour is unchanged.
 func CmdScan(args []string) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	jsonOut := fs.Bool("json", false, "output directory state as JSON (required)")
 	excludeStr := fs.String("exclude", "", "comma-separated exclude patterns")
 	hashFiles := fs.Bool("hash", false, "compute sha256 hash for every regular file")
+	waitStr := fs.String("wait", "", "long-poll for a change for up to this duration (e.g. 20s); only meaningful with --json")
 
 	positionals, err := cliargs.ParseAnywhere(fs, args)
 	if err != nil {
@@ -186,13 +240,31 @@ func CmdScan(args []string) int {
 
 	dir := manifest.ExpandPath(positionals[0])
 
-	result, symlinks, err := ScanDir(dir, excludes, *hashFiles)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scan: %v\n", err)
-		return 1
-	}
-	if symlinks > 0 {
-		fmt.Fprintf(os.Stderr, "scan: skipped %d symlink(s)\n", symlinks)
+	var result map[string]Entry
+	var symlinks int
+
+	if *waitStr != "" {
+		window, werr := time.ParseDuration(*waitStr)
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "scan: invalid --wait %q: %v\n", *waitStr, werr)
+			return 2
+		}
+		changed := false
+		result, changed = waitForChange(dir, excludes, *hashFiles, window, 250*time.Millisecond)
+		if changed {
+			fmt.Fprintln(os.Stderr, "changed=true")
+		} else {
+			fmt.Fprintln(os.Stderr, "changed=false")
+		}
+	} else {
+		result, symlinks, err = ScanDir(dir, excludes, *hashFiles)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			return 1
+		}
+		if symlinks > 0 {
+			fmt.Fprintf(os.Stderr, "scan: skipped %d symlink(s)\n", symlinks)
+		}
 	}
 
 	enc := json.NewEncoder(os.Stdout)

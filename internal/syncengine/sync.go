@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,14 +28,14 @@ type SyncStats struct {
 	ConflictBackups int // number of successful conflict-loser backups
 }
 
-// CmdSync implements `caravan sync [NAME] [--watch] [--interval 2s] [--dry-run] [--bootstrap] [-f manifest]`.
+// CmdSync implements `caravan sync [NAME] [--watch] [--interval 1s] [--dry-run] [--bootstrap] [-f manifest]`.
 func CmdSync(args []string) int {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	manifestPath := fs.String("f", "", "manifest path")
 	dryRun := fs.Bool("dry-run", false, "print plan without applying")
 	watch := fs.Bool("watch", false, "loop continuously")
-	intervalStr := fs.String("interval", "2s", "watch interval (e.g. 2s)")
+	intervalStr := fs.String("interval", "1s", "local poll interval in watch mode (e.g. 1s)")
 	_ = fs.Bool("bootstrap", false, "bootstrap remote binary (always attempted automatically)")
 
 	positionals, err := cliargs.ParseAnywhere(fs, args)
@@ -89,7 +90,7 @@ func CmdSync(args []string) int {
 		return code
 	}
 
-	// Watch mode.
+	// Watch mode: one goroutine per sync entry.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -98,21 +99,157 @@ func CmdSync(args []string) int {
 	for i, s := range entries {
 		names[i] = s.Name
 	}
-	fmt.Printf("watching %s (interval %s)\n", strings.Join(names, ", "), interval)
+	fmt.Printf("watching %s (local poll %s, remote long-poll 20s)\n", strings.Join(names, ", "), interval)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	var wg sync.WaitGroup
+	for _, s := range entries {
+		s := s // capture
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runWatchEntry(s, *dryRun, interval, sigCh)
+		}()
+	}
+	wg.Wait()
+	return 0
+}
+
+// waitScanResult is the outcome of one WaitScan call delivered on a channel.
+type waitScanResult struct {
+	entries map[string]Entry
+	changed bool
+	err     error
+}
+
+// runWatchEntry is the per-entry watch loop. It runs until sigCh fires.
+//
+// Loop invariant:
+//  1. Run one initial full sync pass.
+//  2. Start a remote WaitScan (20s window) in a goroutine → waitCh.
+//  3. Concurrently poll local dir every interval; compare to prevLocal.
+//  4. Whichever fires first:
+//     - local change  → sync, drain/discard in-flight WaitScan, restart loop.
+//     - WaitScan changed=true  → sync, restart loop.
+//     - WaitScan changed=false → restart loop (no sync).
+//     - WaitScan error → warn, exponential back-off, restart loop.
+//     - sigCh → return.
+func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh <-chan os.Signal) {
+	const remoteWindow = 20 * time.Second
+	const backoffBase = 5 * time.Second
+	const backoffMax = 60 * time.Second
+
+	// Initial sync pass.
+	if err := runSyncEntry(s, dryRun, true); err != nil {
+		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
+	}
+
+	localRoot := manifest.ExpandPath(s.Local)
+	excludes := s.Excludes()
+
+	// Establish initial local snapshot for change detection.
+	prevLocal, _, _ := ScanDir(localRoot, excludes, s.Checksum)
+
+	backoff := backoffBase
+	var waitSuppressedUntil time.Time
 
 	for {
-		select {
-		case <-sigCh:
-			return 0
-		case <-ticker.C:
-			for _, s := range entries {
-				if err := runSyncEntry(s, *dryRun, true); err != nil {
-					fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
-				}
+		// Parse remote to run WaitScan.
+		remote, err := ParseRemote(s.Remote)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sync %s: parse remote: %v\n", s.Name, err)
+			// Wait for signal or sleep before retry.
+			select {
+			case <-sigCh:
+				return
+			case <-time.After(backoff):
 			}
+			continue
+		}
+
+		// While the remote long-poll is in an error-backoff window, keep local
+		// polling at full cadence and only retry the long-poll when the window
+		// expires — a broken remote must never blind us to local changes.
+		var waitCh chan waitScanResult
+		var retryC <-chan time.Time
+		if d := time.Until(waitSuppressedUntil); d > 0 {
+			retryC = time.After(d)
+		} else {
+			waitCh = make(chan waitScanResult, 1)
+			go func() {
+				entries, changed, err := remote.WaitScan(excludes, s.Checksum, remoteWindow)
+				waitCh <- waitScanResult{entries: entries, changed: changed, err: err}
+			}()
+		}
+
+		// Local poll ticker.
+		ticker := time.NewTicker(localPoll)
+
+		triggered := false
+		var drainWait bool
+
+	pollLoop:
+		for {
+			select {
+			case <-sigCh:
+				ticker.Stop()
+				// Drain waitCh so the goroutine can exit.
+				go func() { <-waitCh }()
+				return
+
+			case <-ticker.C:
+				cur, _, _ := ScanDir(localRoot, excludes, s.Checksum)
+				if !entriesEqual(prevLocal, cur) {
+					prevLocal = cur
+					triggered = true
+					drainWait = true
+					break pollLoop
+				}
+
+			case <-retryC:
+				// Backoff window over — restart the loop to attempt a fresh
+				// long-poll. (retryC is nil unless suppressed; nil never fires.)
+				break pollLoop
+
+			case res := <-waitCh:
+				if res.err != nil {
+					fmt.Fprintf(os.Stderr, "sync %s: remote wait-scan error: %v; local polling continues, retrying long-poll in %s\n",
+						s.Name, res.err, backoff)
+					waitSuppressedUntil = time.Now().Add(backoff)
+					backoff *= 2
+					if backoff > backoffMax {
+						backoff = backoffMax
+					}
+					// Run a full pass now: its remote scan performs the
+					// bootstrap/version handshake, which heals the most likely
+					// cause — a stale remote binary that predates --wait.
+					triggered = true
+					break pollLoop
+				}
+				// Success — reset backoff.
+				backoff = backoffBase
+				if res.changed {
+					triggered = true
+				}
+				break pollLoop
+			}
+		}
+
+		ticker.Stop()
+
+		if drainWait {
+			// Local change fired first; drain the in-flight WaitScan asynchronously
+			// so its goroutine is not leaked. A single redundant sync pass from a
+			// late-arriving changed=true is acceptable (cheap no-op or catches an
+			// additional remote change).
+			go func() { <-waitCh }()
+		}
+
+		if triggered {
+			if err := runSyncEntry(s, dryRun, true); err != nil {
+				fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
+			}
+			// Refresh local snapshot after sync.
+			prevLocal, _, _ = ScanDir(localRoot, excludes, s.Checksum)
 		}
 	}
 }
@@ -554,7 +691,7 @@ func backupRemoteLoser(syncName string, remote *RemoteConn, rel string) int {
 			quotePath(remoteSrc),
 			quotePath(remoteDst),
 		)
-		if err := exec.Command("ssh", "-o", "BatchMode=yes", remote.Host, cmd).Run(); err != nil {
+		if err := sshCommand(remote.Host, cmd).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "conflict backup remote %s: %v\n", rel, err)
 			return 0
 		}

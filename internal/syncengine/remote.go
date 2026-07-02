@@ -1,6 +1,8 @@
 package syncengine
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"caravan/internal/buildinfo"
 )
@@ -55,6 +58,31 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 	return &RemoteConn{Kind: transportSSH, Host: host, Root: path}, nil
 }
 
+
+// sshBaseArgs are the options applied to every ssh invocation. ControlMaster
+// multiplexing means the first call opens a master connection that subsequent
+// calls (scans, transfers, deletes) reuse, eliminating per-op handshake cost;
+// the master lingers 60s past the last use.
+func sshBaseArgs() []string {
+	return []string{
+		"-o", "BatchMode=yes",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", "ControlPersist=60s",
+	}
+}
+
+// sshCommand builds an ssh exec.Cmd for host running remoteCmd.
+func sshCommand(host, remoteCmd string) *exec.Cmd {
+	args := append(sshBaseArgs(), host, remoteCmd)
+	return exec.Command("ssh", args...)
+}
+
+// sshCarrier is the -e argument handed to rsync.
+func sshCarrier() string {
+	return "ssh " + strings.Join(sshBaseArgs(), " ")
+}
+
 // --- Scan ---
 
 // Scan returns an Entry map for the remote root, applying excludes.
@@ -81,19 +109,9 @@ func (r *RemoteConn) scanLocal(excludes []string, hashFiles bool) (map[string]En
 }
 
 func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap bool) (map[string]Entry, error) {
-	excArg := strings.Join(excludes, ",")
-	remotePath := shellRemotePath(r.Root)
-	var cmd string
-	if excArg != "" {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json --exclude %q %s`, excArg, remotePath)
-	} else {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json %s`, remotePath)
-	}
-	if hashFiles {
-		cmd += " --hash"
-	}
+	cmd := r.buildScanCmdStr(excludes, hashFiles, "")
 
-	out, err := exec.Command("ssh", "-o", "BatchMode=yes", r.Host, cmd).Output()
+	out, err := sshCommand(r.Host, cmd).Output()
 	if err != nil {
 		if allowBootstrap && looksLikeMissingBinary(err, out) {
 			fmt.Fprintf(os.Stderr, "caravan: remote binary not found on %s; bootstrapping…\n", r.Host)
@@ -142,6 +160,86 @@ func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap b
 	return result.Entries, nil
 }
 
+// buildScanCmdStr returns the shell command string used to invoke
+// `caravan scan --json [--exclude …] [--hash] [--wait <window>]` on the remote.
+// window="" means no --wait flag is appended (standard point-in-time scan).
+func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window string) string {
+	excArg := strings.Join(excludes, ",")
+	remotePath := shellRemotePath(r.Root)
+	var cmd string
+	if excArg != "" {
+		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json --exclude %q %s`, excArg, remotePath)
+	} else {
+		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json %s`, remotePath)
+	}
+	if hashFiles {
+		cmd += " --hash"
+	}
+	if window != "" {
+		cmd += " --wait " + window
+	}
+	return cmd
+}
+
+// WaitScan runs a long-poll scan on the remote side: it invokes
+// `caravan scan --json --wait <window>` via SSH (or calls waitForChange
+// directly for local: transport). It returns the resulting entry map, whether
+// a change was detected, and any error.
+//
+// For SSH transport, the remote binary signals change/no-change by printing
+// "changed=true" or "changed=false" to its stderr. If that line is absent
+// (older remote without --wait support), WaitScan treats the result as
+// changed=true (safe: the caller will run a full sync pass that no-ops if
+// nothing actually changed).
+func (r *RemoteConn) WaitScan(excludes []string, hashFiles bool, window time.Duration) (map[string]Entry, bool, error) {
+	switch r.Kind {
+	case transportLocal:
+		entries, changed := waitForChange(r.Root, excludes, hashFiles, window, 250*time.Millisecond)
+		return entries, changed, nil
+	case transportSSH:
+		return r.waitScanSSH(excludes, hashFiles, window)
+	}
+	return nil, false, fmt.Errorf("unknown transport kind %d", r.Kind)
+}
+
+func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.Duration) (map[string]Entry, bool, error) {
+	windowStr := window.Round(time.Millisecond).String()
+	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr)
+
+	cmd := sshCommand(r.Host, cmdStr)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Run(); err != nil {
+		return nil, true, fmt.Errorf("remote wait-scan on %s: %w (stderr: %s)", r.Host, err, stderrBuf.String())
+	}
+
+	// Parse change signal from stderr.
+	changed := true // safe default: treat unknown as changed
+	scanner := bufio.NewScanner(&stderrBuf)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "changed=true" {
+			changed = true
+			break
+		}
+		if line == "changed=false" {
+			changed = false
+			break
+		}
+	}
+
+	var result ScanResult
+	if err := json.Unmarshal(stdoutBuf.Bytes(), &result); err != nil {
+		return nil, true, fmt.Errorf("parse remote wait-scan: %w", err)
+	}
+	if result.Entries == nil {
+		result.Entries = map[string]Entry{}
+	}
+	return result.Entries, changed, nil
+}
+
 func looksLikeMissingBinary(err error, out []byte) bool {
 	if ee, ok := err.(*exec.ExitError); ok {
 		if ee.ExitCode() == 127 {
@@ -170,7 +268,7 @@ func looksLikeMissingDir(err error, _ []byte) bool {
 // bootstrap copies the current executable to ~/.local/bin/caravan on the remote.
 func (r *RemoteConn) bootstrap() error {
 	// Verify architecture matches.
-	uname, err := exec.Command("ssh", "-o", "BatchMode=yes", r.Host, "uname -sm").Output()
+	uname, err := sshCommand(r.Host, "uname -sm").Output()
 	if err != nil {
 		return fmt.Errorf("uname check: %w", err)
 	}
@@ -190,8 +288,7 @@ func (r *RemoteConn) bootstrap() error {
 	}
 	defer exeFile.Close()
 
-	install := exec.Command("ssh", "-o", "BatchMode=yes", r.Host,
-		`mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
+	install := sshCommand(r.Host, `mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
 	install.Stdin = exeFile
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -269,7 +366,7 @@ func (r *RemoteConn) MkdirAll(rel string) error {
 func (r *RemoteConn) mkdirSSH(rel string) error {
 	target := absoluteRemotePath(r.Root, rel)
 	cmd := fmt.Sprintf("mkdir -p %s", shellRemotePath(target))
-	return exec.Command("ssh", "-o", "BatchMode=yes", r.Host, cmd).Run()
+	return sshCommand(r.Host, cmd).Run()
 }
 
 // --- Push (local → remote) ---
@@ -324,7 +421,7 @@ func (r *RemoteConn) pushSSH(localRoot string, paths []string) error {
 	sshScript := fmt.Sprintf(`mkdir -p %s && tar -C %s -xpf -`, remoteRoot, remoteRoot)
 
 	tarCmd := exec.Command("tar", "-C", localRoot, "-cf", "-", "-T", tmpList.Name())
-	sshCmd := exec.Command("ssh", "-o", "BatchMode=yes", r.Host, sshScript)
+	sshCmd := sshCommand(r.Host, sshScript)
 
 	pr, pw := io.Pipe()
 	tarCmd.Stdout = pw
@@ -401,7 +498,7 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 		remoteRoot, os.Getpid(), os.Getpid(), os.Getpid(),
 	)
 
-	sshCmd := exec.Command("ssh", "-o", "BatchMode=yes", r.Host, sshScript)
+	sshCmd := sshCommand(r.Host, sshScript)
 	sshCmd.Stdin = strings.NewReader(listData)
 	sshCmd.Stderr = os.Stderr
 
@@ -487,7 +584,7 @@ func (r *RemoteConn) deleteSSH(paths []string, recursive bool) error {
 		args = append(args, abs)
 	}
 	cmd := "rm " + strings.Join(args, " ")
-	return exec.Command("ssh", "-o", "BatchMode=yes", r.Host, cmd).Run()
+	return sshCommand(r.Host, cmd).Run()
 }
 
 // --- Rsync delta transfer ---
@@ -506,7 +603,7 @@ func (r *RemoteConn) deleteSSH(paths []string, recursive bool) error {
 // for paths that start with ~/ we switch to double-quotes to allow $HOME.
 func rsyncArgs(push bool, host, localPath, remotePath string) []string {
 	remote := formatRsyncRemotePath(host, remotePath)
-	args := []string{"-pt", "-e", "ssh -o BatchMode=yes"}
+	args := []string{"-pt", "-e", sshCarrier()}
 	if push {
 		args = append(args, localPath, remote)
 	} else {

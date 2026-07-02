@@ -96,7 +96,7 @@ func TestPartitionBySize_Empty(t *testing.T) {
 
 func TestRsyncArgs_Push(t *testing.T) {
 	got := rsyncArgs(true, "user@host", "/local/path/file.txt", "/remote/root/file.txt")
-	want := []string{"-pt", "-e", "ssh -o BatchMode=yes", "/local/path/file.txt", `user@host:'/remote/root/file.txt'`}
+	want := []string{"-pt", "-e", sshCarrier(), "/local/path/file.txt", `user@host:'/remote/root/file.txt'`}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rsyncArgs push:\n  got  %v\n  want %v", got, want)
 	}
@@ -104,7 +104,7 @@ func TestRsyncArgs_Push(t *testing.T) {
 
 func TestRsyncArgs_Pull(t *testing.T) {
 	got := rsyncArgs(false, "user@host", "/local/path/file.txt", "/remote/root/file.txt")
-	want := []string{"-pt", "-e", "ssh -o BatchMode=yes", `user@host:'/remote/root/file.txt'`, "/local/path/file.txt"}
+	want := []string{"-pt", "-e", sshCarrier(), `user@host:'/remote/root/file.txt'`, "/local/path/file.txt"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rsyncArgs pull:\n  got  %v\n  want %v", got, want)
 	}
@@ -113,7 +113,7 @@ func TestRsyncArgs_Pull(t *testing.T) {
 func TestRsyncArgs_HomePath_Push(t *testing.T) {
 	// Paths starting with ~/ must use $HOME expansion (double-quotes on remote side).
 	got := rsyncArgs(true, "bob@server", "/home/bob/sync/bigfile.bin", "~/sync/bigfile.bin")
-	want := []string{"-pt", "-e", "ssh -o BatchMode=yes", "/home/bob/sync/bigfile.bin", `bob@server:"$HOME/sync/bigfile.bin"`}
+	want := []string{"-pt", "-e", sshCarrier(), "/home/bob/sync/bigfile.bin", `bob@server:"$HOME/sync/bigfile.bin"`}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rsyncArgs home push:\n  got  %v\n  want %v", got, want)
 	}
@@ -121,7 +121,7 @@ func TestRsyncArgs_HomePath_Push(t *testing.T) {
 
 func TestRsyncArgs_HomePath_Pull(t *testing.T) {
 	got := rsyncArgs(false, "bob@server", "/home/bob/sync/bigfile.bin", "~/sync/bigfile.bin")
-	want := []string{"-pt", "-e", "ssh -o BatchMode=yes", `bob@server:"$HOME/sync/bigfile.bin"`, "/home/bob/sync/bigfile.bin"}
+	want := []string{"-pt", "-e", sshCarrier(), `bob@server:"$HOME/sync/bigfile.bin"`, "/home/bob/sync/bigfile.bin"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rsyncArgs home pull:\n  got  %v\n  want %v", got, want)
 	}
@@ -129,7 +129,7 @@ func TestRsyncArgs_HomePath_Pull(t *testing.T) {
 
 func TestRsyncArgs_BareHome(t *testing.T) {
 	got := rsyncArgs(true, "user@host", "/local/file", "~")
-	want := []string{"-pt", "-e", "ssh -o BatchMode=yes", "/local/file", `user@host:"$HOME"`}
+	want := []string{"-pt", "-e", sshCarrier(), "/local/file", `user@host:"$HOME"`}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rsyncArgs bare ~:\n  got  %v\n  want %v", got, want)
 	}
