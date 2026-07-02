@@ -552,3 +552,58 @@ func TestCmdUpPullFailEnvStillWritten(t *testing.T) {
 		t.Errorf("expected '.env written' in output; got:\n%s", out)
 	}
 }
+
+// TestCmdUpFreshCloneWritesEnv verifies the FIRST up on a fresh machine
+// materialises .env for a repo it just cloned (regression: the clone path
+// used to return early, skipping secrets/direnv/mise entirely).
+func TestCmdUpFreshCloneWritesEnv(t *testing.T) {
+	dir := t.TempDir()
+
+	secrets.KeyPath = filepath.Join(dir, "age.key")
+	t.Cleanup(func() { secrets.KeyPath = "" })
+
+	wsRoot := filepath.Join(dir, "ws")
+	sourceDir := filepath.Join(dir, "source")
+	initGitRepo(t, sourceDir)
+
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: wsRoot},
+		Repos:     []manifest.Repo{{Name: "myrepo", URL: sourceDir}},
+		Secrets:   manifest.Secrets{File: "secrets.enc.json"},
+	}
+	manifestPath := filepath.Join(dir, "caravan.toml")
+	if err := manifest.Save(manifestPath, m); err != nil {
+		t.Fatalf("Save manifest: %v", err)
+	}
+
+	captureStdout(t, func() {
+		if code := secrets.CmdSecrets([]string{"init", "-f", manifestPath}); code != 0 {
+			t.Errorf("secrets init returned %d", code)
+		}
+	})
+	captureStdout(t, func() {
+		if code := secrets.CmdSecrets([]string{"set", "-f", manifestPath, "myrepo", "API_KEY", "fresh"}); code != 0 {
+			t.Errorf("secrets set returned %d", code)
+		}
+	})
+
+	var code int
+	out := captureStdout(t, func() {
+		code = provision.CmdUp([]string{"-f", manifestPath})
+	})
+	if code != 0 {
+		t.Fatalf("CmdUp returned %d; output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "cloned") {
+		t.Errorf("expected 'cloned' in output; got:\n%s", out)
+	}
+
+	data, err := os.ReadFile(filepath.Join(wsRoot, "myrepo", ".env"))
+	if err != nil {
+		t.Fatalf(".env not written on fresh clone: %v", err)
+	}
+	if !strings.Contains(string(data), "API_KEY=fresh") {
+		t.Errorf(".env missing API_KEY; contents:\n%s", data)
+	}
+}

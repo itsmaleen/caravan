@@ -9,12 +9,14 @@ import (
 type Op string
 
 const (
-	OpPush         Op = "push"
-	OpPull         Op = "pull"
-	OpDeleteLocal  Op = "deleteLocal"
-	OpDeleteRemote Op = "deleteRemote"
-	OpMkdirLocal   Op = "mkdirLocal"
-	OpMkdirRemote  Op = "mkdirRemote"
+	OpPreDeleteLocal  Op = "preDeleteLocal"  // recursive removal of a path about to be replaced by the opposite type
+	OpPreDeleteRemote Op = "preDeleteRemote" // recursive removal of a path about to be replaced by the opposite type
+	OpPush            Op = "push"
+	OpPull            Op = "pull"
+	OpDeleteLocal     Op = "deleteLocal"
+	OpDeleteRemote    Op = "deleteRemote"
+	OpMkdirLocal      Op = "mkdirLocal"
+	OpMkdirRemote     Op = "mkdirRemote"
 )
 
 // Action is one unit of planned work.
@@ -65,6 +67,66 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
 
 		localModified := hasLocal && hasBase && (l.Size != b.LSize || l.Mtime != b.LMtime)
 		remoteModified := hasRemote && hasBase && (r.Size != b.RSize || r.Mtime != b.RMtime)
+
+		// Type-conflict branch: same path exists on both sides but as different types.
+		// This takes precedence over all other switch cases.
+		if hasLocal && hasRemote && l.IsDir != r.IsDir {
+			localWins := false
+			if hasBase {
+				// The side whose IsDir DIFFERS from base.Dir flipped the type → it wins.
+				localFlipped := b.Dir != l.IsDir
+				remoteFlipped := b.Dir != r.IsDir
+				switch {
+				case localFlipped && !remoteFlipped:
+					localWins = true
+				case !localFlipped && remoteFlipped:
+					localWins = false
+				default:
+					// Both flipped or neither flipped (shouldn't happen with two different
+					// types, but fall through to mtime rule).
+					localWins = l.Mtime >= r.Mtime
+				}
+			} else {
+				// No base: newer mtime wins; tie → local.
+				localWins = l.Mtime >= r.Mtime
+			}
+
+			typeStr := func(isDir bool) string {
+				if isDir {
+					return "dir"
+				}
+				return "file"
+			}
+
+			if localWins {
+				// Pre-delete the remote loser, then propagate local winner.
+				actions = append(actions, Action{
+					Op:       OpPreDeleteRemote,
+					Path:     p,
+					Conflict: true,
+					Reason:   "type change: local " + typeStr(l.IsDir) + " replaces remote " + typeStr(r.IsDir),
+				})
+				if l.IsDir {
+					actions = append(actions, Action{Op: OpMkdirRemote, Path: p, Reason: "type change: local dir"})
+				} else {
+					actions = append(actions, Action{Op: OpPush, Path: p, Reason: "type change: local file"})
+				}
+			} else {
+				// Pre-delete the local loser, then propagate remote winner.
+				actions = append(actions, Action{
+					Op:       OpPreDeleteLocal,
+					Path:     p,
+					Conflict: true,
+					Reason:   "type change: remote " + typeStr(r.IsDir) + " replaces local " + typeStr(l.IsDir),
+				})
+				if r.IsDir {
+					actions = append(actions, Action{Op: OpMkdirLocal, Path: p, Reason: "type change: remote dir"})
+				} else {
+					actions = append(actions, Action{Op: OpPull, Path: p, Reason: "type change: remote file"})
+				}
+			}
+			continue
+		}
 
 		switch {
 		case !hasLocal && !hasRemote:
@@ -180,22 +242,111 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
 		}
 	}
 
+	// Child-action suppression: after the main loop, remove actions that are
+	// strictly under a pre-deleted path and flow TOWARD the losing side.
+	//
+	// For OpPreDeleteRemote on P where local side is a FILE (loser remote was dir):
+	//   Drop all actions under P/ (pulls, mkdirLocal, deleteRemote) because the
+	//   recursive pre-delete covers them and pulls would resurrect loser data.
+	// For OpPreDeleteRemote on P where local side is a DIR (loser remote was file):
+	//   Drop nothing — children pushes to remote must survive.
+	// Mirror for OpPreDeleteLocal.
+	type preDeleteInfo struct {
+		op    Op   // OpPreDeleteLocal or OpPreDeleteRemote
+		isDir bool // IsDir of the WINNER (local or remote, depending on op)
+	}
+	var preDeletes []struct {
+		prefix string
+		info   preDeleteInfo
+	}
+	for _, a := range actions {
+		if a.Op == OpPreDeleteRemote {
+			// winner is local
+			winnerIsDir := local[a.Path].IsDir
+			preDeletes = append(preDeletes, struct {
+				prefix string
+				info   preDeleteInfo
+			}{a.Path, preDeleteInfo{OpPreDeleteRemote, winnerIsDir}})
+		} else if a.Op == OpPreDeleteLocal {
+			// winner is remote
+			winnerIsDir := remote[a.Path].IsDir
+			preDeletes = append(preDeletes, struct {
+				prefix string
+				info   preDeleteInfo
+			}{a.Path, preDeleteInfo{OpPreDeleteLocal, winnerIsDir}})
+		}
+	}
+
+	if len(preDeletes) > 0 {
+		filtered := actions[:0]
+		for _, a := range actions {
+			suppress := false
+			for _, pd := range preDeletes {
+				childPrefix := pd.prefix + "/"
+				if !strings.HasPrefix(a.Path, childPrefix) {
+					continue
+				}
+				// This action is strictly under the pre-deleted path.
+				if pd.info.op == OpPreDeleteRemote {
+					// Local won. If winner is a FILE, drop all children actions
+					// (no children can exist on file winner side, and remote dir
+					// children must not be pulled/mkdirLocal'd).
+					// If winner is a DIR, children pushes survive — drop only
+					// actions that go toward the losing remote side (pulls, mkdirLocal).
+					if !pd.info.isDir {
+						// Local side is a file — no children expected; suppress anything
+						// that would touch either side under this prefix.
+						suppress = true
+					} else {
+						// Local side is a dir — suppress only actions pulling from loser remote.
+						switch a.Op {
+						case OpPull, OpMkdirLocal, OpDeleteRemote:
+							suppress = true
+						}
+					}
+				} else { // OpPreDeleteLocal
+					// Remote won. Mirror logic.
+					if !pd.info.isDir {
+						// Remote side is a file — suppress anything under prefix.
+						suppress = true
+					} else {
+						// Remote side is a dir — suppress only actions pushing from loser local.
+						switch a.Op {
+						case OpPush, OpMkdirRemote, OpDeleteLocal:
+							suppress = true
+						}
+					}
+				}
+				if suppress {
+					break
+				}
+			}
+			if !suppress {
+				filtered = append(filtered, a)
+			}
+		}
+		actions = filtered
+	}
+
 	return sortActions(actions)
 }
 
 // sortActions orders actions so they can be applied safely:
+//  0. preDeleteLocal / preDeleteRemote — deepest first (must run before mkdirs/pushes)
 //  1. mkdirLocal / mkdirRemote — shallowest first
 //  2. push / pull
 //  3. deleteLocal / deleteRemote — deepest first (so child files go before parent dirs)
 func sortActions(actions []Action) []Action {
 	priority := func(op Op) int {
 		switch op {
-		case OpMkdirLocal, OpMkdirRemote:
+		case OpPreDeleteLocal, OpPreDeleteRemote:
 			return 0
-		case OpPush, OpPull:
+		case OpMkdirLocal, OpMkdirRemote:
 			return 1
-		default: // deleteLocal, deleteRemote
+		case OpPush, OpPull:
 			return 2
+		default: // deleteLocal, deleteRemote
+			return 3
 		}
 	}
 
@@ -208,11 +359,16 @@ func sortActions(actions []Action) []Action {
 		di := strings.Count(actions[i].Path, "/")
 		dj := strings.Count(actions[j].Path, "/")
 		if pi == 0 {
+			// preDeletes: deepest first
+			if di != dj {
+				return di > dj
+			}
+		} else if pi == 1 {
 			// mkdirs: shallow first
 			if di != dj {
 				return di < dj
 			}
-		} else if pi == 2 {
+		} else if pi == 3 {
 			// deletes: deepest first
 			if di != dj {
 				return di > dj

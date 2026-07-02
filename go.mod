@@ -1,10 +1,11 @@
 module caravan
 
-go 1.24.0
+go 1.25.0
 
 require (
 	filippo.io/age v1.3.1
 	github.com/BurntSushi/toml v1.6.0
+	golang.org/x/text v0.38.0
 )
 
 require (

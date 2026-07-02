@@ -192,6 +192,15 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 }
 
 // applyActions executes the plan.
+//
+// The action slice is already sorted by sortActions:
+//   0. preDeleteLocal/preDeleteRemote (deepest first) — run inline immediately
+//   1. mkdirLocal/mkdirRemote (shallow first) — run inline immediately
+//   2. push/pull — batched then executed
+//   3. deleteLocal/deleteRemote (deepest first) — batched then executed
+//
+// Pre-deletes are executed inline as they are encountered so that the
+// subsequent mkdir/push/pull operations find a clean slate.
 func applyActions(
 	actions []Action,
 	localRoot string,
@@ -205,7 +214,8 @@ func applyActions(
 	for _, a := range actions {
 		if a.Conflict {
 			winner := "local"
-			if a.Op == OpPull {
+			switch a.Op {
+			case OpPull, OpMkdirLocal, OpPreDeleteLocal:
 				winner = "remote"
 			}
 			fmt.Printf("  conflict: %s (%s wins)\n", a.Path, winner)
@@ -213,6 +223,22 @@ func applyActions(
 		}
 
 		switch a.Op {
+		case OpPreDeleteLocal:
+			// Recursively remove the local path to make room for the remote winner.
+			if err := os.RemoveAll(localJoin(localRoot, a.Path)); err != nil {
+				fmt.Fprintf(os.Stderr, "pre-delete local %s: %v\n", a.Path, err)
+				stats.Errors++
+			} else {
+				stats.DeletedL++
+			}
+		case OpPreDeleteRemote:
+			// Recursively remove the remote path (DeleteDir handles both files and dirs via rm -rf).
+			if err := remote.DeleteDir(a.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "pre-delete remote %s: %v\n", a.Path, err)
+				stats.Errors++
+			} else {
+				stats.DeletedR++
+			}
 		case OpMkdirLocal:
 			if err := os.MkdirAll(localJoin(localRoot, a.Path), 0o755); err != nil {
 				fmt.Fprintf(os.Stderr, "mkdir local %s: %v\n", a.Path, err)
@@ -347,6 +373,8 @@ func printPlan(name string, actions []Action) {
 			marker = "✗"
 		case OpMkdirLocal, OpMkdirRemote:
 			marker = "+"
+		case OpPreDeleteLocal, OpPreDeleteRemote:
+			marker = "⚡"
 		}
 		fmt.Printf("  %s  %-*s  %s  %s\n", marker, maxPath, a.Path, opSide(a.Op), a.Reason)
 	}
@@ -354,9 +382,9 @@ func printPlan(name string, actions []Action) {
 
 func opSide(op Op) string {
 	switch op {
-	case OpPush, OpMkdirRemote, OpDeleteRemote:
+	case OpPush, OpMkdirRemote, OpDeleteRemote, OpPreDeleteRemote:
 		return "→remote"
-	case OpPull, OpMkdirLocal, OpDeleteLocal:
+	case OpPull, OpMkdirLocal, OpDeleteLocal, OpPreDeleteLocal:
 		return "←local "
 	}
 	return "       "

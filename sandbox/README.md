@@ -91,3 +91,76 @@ To inject an age key in devcontainers, add a `mounts` entry to
   "source=${localEnv:HOME}/.config/caravan/age.key,target=/root/.config/caravan/age.key,type=bind,readonly"
 ]
 ```
+
+## Toolchain (mise) validation
+
+`sandbox/Dockerfile.mise` validates the mise integration end-to-end inside a
+container without touching host machines. It builds caravan from source (same
+multi-stage pattern as `Dockerfile`), installs mise 2026.6.14 to
+`/usr/local/bin/mise` via the official install script, creates a local fixture
+git repo at `/srv/fixture` (pinning `jq = "1.7.1"` in a `mise.toml`), and
+bakes a manifest that clones `file:///srv/fixture` with `[toolchain] mise = true`.
+
+### Build
+
+```
+docker build -f sandbox/Dockerfile.mise -t caravan-mise:local .
+```
+
+### Run and verify
+
+```
+# First run: cold-start provision (clone)
+docker run --rm caravan-mise:local
+
+# Verify mise installed the pinned tool (overridden entrypoint):
+docker run --rm --entrypoint /bin/bash caravan-mise:local \
+  -c "caravan up && caravan up && mise exec -C /root/code/fixture -- jq --version"
+```
+
+### Measured results
+
+Cold-start timing (wall clock of `docker run`):
+
+- First run (fresh clone only): **~0.35 s** (`took 13 ms` caravan-internal time)
+- Second run in same container (pull + mise install of jq 1.7.1): **~1.37 s** (`took ~1 s`)
+
+Verification output:
+
+```
+  NAME     ACTION  BRANCH  DETAIL
+✓ fixture  cloned  main
+
+took 12ms
+  NAME     ACTION      BRANCH  DETAIL
+✓ fixture  up-to-date  main
+
+took 1.022s
+jq-1.7.1
+```
+
+### Bug found: mise not invoked on initial clone
+
+`caravan up` **does not run `mise install` when a repo is freshly cloned**.
+In `internal/provision/up.go`, `processRepo` handles the "repo does not exist"
+case with an early return:
+
+```
+// up.go:103-108
+switch {
+case os.IsNotExist(statErr):
+    if dryRun {
+        return "would clone", "", "", false
+    }
+    return cloneRepo(r, dir)   // <-- returns here; mise block never reached
+```
+
+The mise integration block at lines 165-176 is only reached when the repo
+already exists (the `pullRepo` path). On a truly fresh machine, `caravan up`
+must be run **twice** for mise to provision toolchains: once to clone, once
+to pull (no-op) and invoke `mise install`.
+
+This means `mise exec -C /root/code/fixture -- jq --version` fails after a
+single `caravan up` on a blank container; it only works after a second run.
+The mise integration itself (`exec.Command("mise", "install")` with `cmd.Dir`
+set correctly, `MISE_YES=1` handling trust prompts) is otherwise correct.

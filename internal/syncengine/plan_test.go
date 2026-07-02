@@ -364,3 +364,191 @@ func countSlash(s string) int {
 	}
 	return n
 }
+
+// --- type-conflict tests ---
+
+// TestPlanTypeConflict_FileToDir_WithBase: local flipped file→dir (base.Dir==false,
+// local.IsDir==true, remote.IsDir==false) → local wins: preDeleteRemote + mkdirRemote.
+func TestPlanTypeConflict_FileToDir_LocalFlip_WithBase(t *testing.T) {
+	base := map[string]BaseEntry{
+		"flip": be(100, 1000, 100, 1000, false), // base was a file
+	}
+	local := map[string]Entry{
+		"flip": de(2000), // now a dir locally
+	}
+	remote := map[string]Entry{
+		"flip": fe(100, 1000), // still the file remotely (unchanged)
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpMkdirRemote, "flip",
+	))
+	// Verify ordering: preDelete before mkdir.
+	if actions[0].Op != OpPreDeleteRemote {
+		t.Errorf("expected preDeleteRemote first, got %s", actions[0].Op)
+	}
+	if actions[1].Op != OpMkdirRemote {
+		t.Errorf("expected mkdirRemote second, got %s", actions[1].Op)
+	}
+	// Verify conflict flag on preDelete.
+	if !actions[0].Conflict {
+		t.Errorf("expected Conflict=true on preDeleteRemote action")
+	}
+}
+
+// TestPlanTypeConflict_DirToFile_LocalFlip_WithBase: local flipped dir→file
+// (base.Dir==true, local.IsDir==false, remote.IsDir==true) → local wins: preDeleteRemote + push.
+func TestPlanTypeConflict_DirToFile_LocalFlip_WithBase(t *testing.T) {
+	base := map[string]BaseEntry{
+		"flip": be(0, 1000, 0, 1000, true), // base was a dir
+	}
+	local := map[string]Entry{
+		"flip": fe(50, 2000), // now a file locally
+	}
+	remote := map[string]Entry{
+		"flip": de(1000), // still a dir remotely (unchanged)
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpPush, "flip",
+	))
+	if actions[0].Op != OpPreDeleteRemote {
+		t.Errorf("expected preDeleteRemote first, got %s", actions[0].Op)
+	}
+	if actions[1].Op != OpPush {
+		t.Errorf("expected push second, got %s", actions[1].Op)
+	}
+}
+
+// TestPlanTypeConflict_RemoteFlip_WithBase: remote flipped file→dir
+// (base.Dir==false, remote.IsDir==true, local.IsDir==false) → remote wins: preDeleteLocal + mkdirLocal.
+func TestPlanTypeConflict_RemoteFlip_WithBase(t *testing.T) {
+	base := map[string]BaseEntry{
+		"flip": be(100, 1000, 100, 1000, false), // base was a file
+	}
+	local := map[string]Entry{
+		"flip": fe(100, 1000), // still the file locally (unchanged)
+	}
+	remote := map[string]Entry{
+		"flip": de(2000), // now a dir remotely
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteLocal, "flip",
+		OpMkdirLocal, "flip",
+	))
+	if actions[0].Op != OpPreDeleteLocal {
+		t.Errorf("expected preDeleteLocal first, got %s", actions[0].Op)
+	}
+	if actions[1].Op != OpMkdirLocal {
+		t.Errorf("expected mkdirLocal second, got %s", actions[1].Op)
+	}
+	if !actions[0].Conflict {
+		t.Errorf("expected Conflict=true on preDeleteLocal action")
+	}
+}
+
+// TestPlanTypeConflict_NoBase_LocalNewer: no base, local file vs remote dir,
+// local is newer → local wins: preDeleteRemote + push.
+func TestPlanTypeConflict_NoBase_LocalNewer(t *testing.T) {
+	base := map[string]BaseEntry{}
+	local := map[string]Entry{
+		"flip": fe(50, 3000), // local file, newer
+	}
+	remote := map[string]Entry{
+		"flip": de(1000), // remote dir, older
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpPush, "flip",
+	))
+}
+
+// TestPlanTypeConflict_NoBase_RemoteNewer: no base, local dir vs remote file,
+// remote is newer → remote wins: preDeleteLocal + pull.
+func TestPlanTypeConflict_NoBase_RemoteNewer(t *testing.T) {
+	base := map[string]BaseEntry{}
+	local := map[string]Entry{
+		"flip": de(1000), // local dir, older
+	}
+	remote := map[string]Entry{
+		"flip": fe(50, 3000), // remote file, newer
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteLocal, "flip",
+		OpPull, "flip",
+	))
+}
+
+// TestPlanTypeConflict_NoBase_Tie: no base, tie mtime → local wins.
+func TestPlanTypeConflict_NoBase_Tie(t *testing.T) {
+	base := map[string]BaseEntry{}
+	local := map[string]Entry{
+		"flip": fe(50, 2000), // local file, same mtime
+	}
+	remote := map[string]Entry{
+		"flip": de(2000), // remote dir, same mtime
+	}
+	actions := Plan(base, local, remote)
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpPush, "flip",
+	))
+}
+
+// TestPlanTypeConflict_ChildSuppression_LocalFileWinsOverRemoteDir: remote dir
+// "flip" with children loses to local file "flip".  Children pulls/mkdirLocal
+// actions under "flip/" must be suppressed (pre-delete covers them recursively).
+func TestPlanTypeConflict_ChildSuppression_LocalFileWinsOverRemoteDir(t *testing.T) {
+	base := map[string]BaseEntry{}
+	local := map[string]Entry{
+		"flip": fe(50, 3000), // local file, newer wins
+	}
+	remote := map[string]Entry{
+		"flip":         de(1000),           // remote dir, loses
+		"flip/child":   de(1000),           // remote dir child
+		"flip/child/f": fe(10, 1000),       // remote file grandchild
+	}
+	actions := Plan(base, local, remote)
+	// Expect: preDeleteRemote(flip) + push(flip).
+	// Children under flip/ must be suppressed (no pull/mkdirLocal for them).
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpPush, "flip",
+	))
+}
+
+// TestPlanTypeConflict_ChildSuppression_LocalDirWinsOverRemoteFile: local dir
+// "flip" with children wins over remote file "flip".  Children pushes under
+// "flip/" must SURVIVE (they go to the winner's side — remote).
+func TestPlanTypeConflict_ChildSuppression_LocalDirWinsOverRemoteFile(t *testing.T) {
+	base := map[string]BaseEntry{}
+	local := map[string]Entry{
+		"flip":       de(3000),     // local dir, newer wins
+		"flip/child": fe(10, 3000), // local child file
+	}
+	remote := map[string]Entry{
+		"flip": fe(50, 1000), // remote file, loses
+	}
+	actions := Plan(base, local, remote)
+	// Expect: preDeleteRemote(flip) + mkdirRemote(flip) + push(flip/child).
+	checkActions(t, actions, wantOps(
+		OpPreDeleteRemote, "flip",
+		OpMkdirRemote, "flip",
+		OpPush, "flip/child",
+	))
+	// Ordering: preDelete → mkdir → push
+	if actions[0].Op != OpPreDeleteRemote {
+		t.Errorf("action[0] should be preDeleteRemote, got %s", actions[0].Op)
+	}
+	if actions[1].Op != OpMkdirRemote {
+		t.Errorf("action[1] should be mkdirRemote, got %s", actions[1].Op)
+	}
+	if actions[2].Op != OpPush {
+		t.Errorf("action[2] should be push, got %s", actions[2].Op)
+	}
+}

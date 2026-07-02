@@ -105,27 +105,33 @@ func processRepo(r manifest.Repo, dir, secretsPath string, useMise, dryRun bool)
 		if dryRun {
 			return "would clone", "", "", false
 		}
-		return cloneRepo(r, dir)
+		// Fresh clone falls through to the secrets/direnv/mise steps below —
+		// a fresh machine must get its full provisioning from the first up.
+		action, branch, detail, failed = cloneRepo(r, dir)
+		if failed {
+			return action, branch, detail, failed
+		}
 
 	case statErr != nil:
 		return "error", "", statErr.Error(), true
 
 	case !fi.IsDir():
 		return "error", "", "path occupied (not a directory)", true
+
+	default:
+		// Existing directory: must be a git repo; pull it.
+		if _, err := os.Stat(filepath.Join(dir, ".git")); os.IsNotExist(err) {
+			return "error", "", "path occupied (not a git repo)", true
+		}
+
+		branch = currentBranch(dir)
+
+		if dryRun {
+			return "would pull", branch, "", false
+		}
+
+		action, detail, failed = pullRepo(dir)
 	}
-
-	// Check for .git directory.
-	if _, err := os.Stat(filepath.Join(dir, ".git")); os.IsNotExist(err) {
-		return "error", "", "path occupied (not a git repo)", true
-	}
-
-	branch = currentBranch(dir)
-
-	if dryRun {
-		return "would pull", branch, "", false
-	}
-
-	action, detail, failed = pullRepo(dir)
 
 	// Secrets: write .env even when pull failed — the repo dir exists and
 	// secrets/direnv should still be materialised so the developer can work.

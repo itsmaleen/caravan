@@ -1,0 +1,52 @@
+# ── stage 1: build caravan from source ───────────────────────────────────────
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /src
+
+# Fetch deps first so this layer is cached between code-only changes.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest of the source and build a fully-static binary.
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /caravan .
+
+# ── stage 2: slim runtime image with mise ─────────────────────────────────────
+FROM debian:bookworm-slim
+
+# git, ca-certificates: required by caravan up.
+# curl: required by the mise install script.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install mise to /usr/local/bin so it is on PATH for all users.
+# Download the install script separately to avoid pipe-to-sh reliability issues.
+RUN curl -fsSL https://mise.run -o /tmp/mise-install.sh \
+ && MISE_INSTALL_PATH=/usr/local/bin/mise sh /tmp/mise-install.sh \
+ && rm /tmp/mise-install.sh \
+ && mise --version
+
+# Tell mise to skip trust prompts in non-interactive/CI environments.
+ENV MISE_YES=1
+
+# Caravan binary from the builder stage.
+COPY --from=builder /caravan /usr/local/bin/caravan
+
+# Create a local fixture git repo at build time.
+# Pins jq 1.7.1 — a single static binary, fast to download.
+RUN git -c init.defaultBranch=main init /srv/fixture \
+ && git -C /srv/fixture config user.email "caravan@example.com" \
+ && git -C /srv/fixture config user.name "Caravan Test" \
+ && printf '[tools]\njq = "1.7.1"\n' > /srv/fixture/mise.toml \
+ && printf '# fixture\nTest repo for caravan mise integration.\n' > /srv/fixture/README.md \
+ && git -C /srv/fixture add mise.toml README.md \
+ && git -C /srv/fixture commit -m "initial"
+
+# Bake the manifest — clones the local fixture repo with [toolchain] mise = true.
+RUN mkdir -p /root/.config/caravan \
+ && printf 'version = 1\n\n[workspace]\nroot = "/root/code"\n\n[[repos]]\nname   = "fixture"\nurl    = "file:///srv/fixture"\npath   = "fixture"\n\n[toolchain]\nmise = true\n' \
+    > /root/.config/caravan/caravan.toml
+
+# Every `docker run` is a fresh container — caravan up provisions the workspace.
+ENTRYPOINT ["/usr/local/bin/caravan", "up"]

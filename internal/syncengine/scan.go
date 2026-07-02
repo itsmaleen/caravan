@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/text/unicode/norm"
+
 	"caravan/internal/buildinfo"
 	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
@@ -57,6 +59,12 @@ func ScanDir(root string, excludes []string) (map[string]Entry, int, error) {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
+		// Normalize to NFC so both sides of a sync agree on the key even when
+		// one filesystem stores NFD (macOS tar extraction does): APFS lookups
+		// are normalization-insensitive, so operating on the NFC name still
+		// reaches an NFD-stored file. Without this, unicode names ping-pong
+		// as "new" on both sides forever.
+		rel = norm.NFC.String(rel)
 
 		// Skip paths with characters that would break shell quoting.
 		if strings.ContainsAny(rel, "'\n") {

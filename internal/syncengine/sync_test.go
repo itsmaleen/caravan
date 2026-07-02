@@ -441,3 +441,117 @@ func TestLoadSaveState(t *testing.T) {
 		t.Errorf("pairs: got %v", got.Pairs)
 	}
 }
+
+// --- type-flip integration tests ---
+
+// assertIsFile checks that root/rel exists and is a regular file (not a dir).
+func assertIsFile(t *testing.T, root, rel string) {
+	t.Helper()
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	info, err := os.Lstat(full)
+	if err != nil {
+		t.Errorf("assertIsFile %s: %v", rel, err)
+		return
+	}
+	if info.IsDir() {
+		t.Errorf("assertIsFile %s: expected file, got directory", rel)
+	}
+}
+
+// TestIntegration_TypeFlip_LocalFileToDir: establish base with local file "flip",
+// then locally replace it with a directory containing a child file, sync → remote
+// should have a dir "flip" with the child inside, and no stale file at "flip".
+func TestIntegration_TypeFlip_LocalFileToDir(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed file and establish base.
+	seedFile(t, sideA, "flip", "original file", t1())
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertIsFile(t, sideB, "flip")
+
+	// Step 2: locally replace the file with a directory containing a child.
+	if err := os.Remove(filepath.Join(sideA, "flip")); err != nil {
+		t.Fatalf("remove local file: %v", err)
+	}
+	seedFile(t, sideA, "flip/inner.txt", "inside dir", t2())
+
+	// Step 3: sync — remote stale file must be pre-deleted, dir + child pushed.
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	assertDir(t, sideB, "flip")
+	assertFile(t, sideB, "flip/inner.txt", "inside dir")
+	assertDir(t, sideA, "flip")
+	assertFile(t, sideA, "flip/inner.txt", "inside dir")
+}
+
+// TestIntegration_TypeFlip_LocalDirToFile: establish base with local dir "flip"
+// containing a child, then locally replace it with a file, sync → remote should
+// have file "flip" and no stale dir.
+func TestIntegration_TypeFlip_LocalDirToFile(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed dir with child and establish base.
+	seedFile(t, sideA, "flip/child.txt", "child content", t1())
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertDir(t, sideB, "flip")
+	assertFile(t, sideB, "flip/child.txt", "child content")
+
+	// Step 2: locally replace the dir with a file.
+	if err := os.RemoveAll(filepath.Join(sideA, "flip")); err != nil {
+		t.Fatalf("remove local dir: %v", err)
+	}
+	seedFile(t, sideA, "flip", "now a file", t2())
+
+	// Step 3: sync — remote stale dir (with child) must be pre-deleted, file pushed.
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	assertIsFile(t, sideB, "flip")
+	assertFile(t, sideB, "flip", "now a file")
+	assertIsFile(t, sideA, "flip")
+	assertAbsent(t, sideB, "flip/child.txt")
+}
+
+// TestIntegration_TypeFlip_RemoteFileToDir: establish base with remote file "flip",
+// then remotely replace it with a directory containing a child, sync → local
+// should have a dir "flip" with the child inside.
+func TestIntegration_TypeFlip_RemoteFileToDir(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed file (on local) and sync to establish base.
+	seedFile(t, sideA, "flip", "original file", t1())
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertIsFile(t, sideA, "flip")
+	assertIsFile(t, sideB, "flip")
+
+	// Step 2: mutate remote — replace file with dir+child.
+	if err := os.Remove(filepath.Join(sideB, "flip")); err != nil {
+		t.Fatalf("remove remote file: %v", err)
+	}
+	seedFile(t, sideB, "flip/inner.txt", "inside remote dir", t2())
+
+	// Step 3: sync — local stale file must be pre-deleted, remote dir pulled.
+	if err := doSync(t, "test", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	assertDir(t, sideA, "flip")
+	assertFile(t, sideA, "flip/inner.txt", "inside remote dir")
+	assertDir(t, sideB, "flip")
+	assertFile(t, sideB, "flip/inner.txt", "inside remote dir")
+}
