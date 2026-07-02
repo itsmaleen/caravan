@@ -1,0 +1,30 @@
+<task-notification>
+<task-id>a9df736f5b75a9d9d</task-id>
+<tool-use-id>toolu_01JLmgCzkw7gSQPGRRFC1Rkp</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a9df736f5b75a9d9d.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement provision + secrets" completed</summary>
+<result>**Files created (8 files, 2255 lines total):**
+
+| File | Lines | Purpose |
+|---|---|---|
+| `internal/manifest/init.go` | 131 | `CmdInit` + `DiscoverRepos` + git helpers |
+| `internal/manifest/init_test.go` | 190 | Discovery tests using real `git init` repos in t.TempDir() |
+| `internal/manifest/manifest_test.go` | 225 | Round-trip, ExpandPath, Validate, ResolvePath, SecretsPath, RepoDir |
+| `internal/provision/up.go` | 327 | `CmdUp`: clone/pull, .env merge, direnv, mise |
+| `internal/provision/status.go` | 157 | `CmdStatus`: repo table + sync-folder last-sync; `var SyncStateDir = ""` for tests |
+| `internal/provision/provision_test.go` | 416 | dry-run, local clone, pull, .env merge, status, readLastSync |
+| `internal/secrets/secrets.go` | 457 | age-encrypted JSON store: `LoadStore`, `DecryptRepoEnv`, `CmdSecrets` (init/set/show/add-machine) |
+| `internal/secrets/secrets_test.go` | 352 | init→set→show→add-machine→decrypt-with-second-key round trip; nil cases; dispatch |
+
+**Commands run:**
+- `go build ./internal/manifest/... ./internal/provision/... ./internal/secrets/...` — clean
+- `go test -v -count=1 ./internal/manifest/... ./internal/provision/... ./internal/secrets/...` — **39/39 PASS**
+
+**Key design decisions / deviations:**
+- `provision.SyncStateDir` package var (analogous to `secrets.KeyPath`) lets tests point the sync-state reader at a tmpdir without touching HOME. SPEC mandates KeyPath but is silent on the sync state dir; this seemed the only way to meet "tests must not touch real HOME config".
+- `--reveal` must precede positional args for `secrets show` (stdlib `flag` stops at first non-flag). SPEC doesn't specify ordering; the flag works correctly when placed before the repo name.
+- Secrets errors in `CmdUp` are soft warnings in the detail column, not hard failures, consistent with the SPEC's "fail soft per-item" directive.
+- No changes to `manifest.go`, `main.go`, `go.mod`, or anything under `internal/syncengine`.</result>
+<usage><subagent_tokens>84080</subagent_tokens><tool_uses>28</tool_uses><duration_ms>795201</duration_ms></usage>
+</task-notification>
