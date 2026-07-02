@@ -1,0 +1,62 @@
+<task-notification>
+<task-id>adcdb166a168d9b57</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/adcdb166a168d9b57.output</output-file>
+<status>completed</status>
+<summary>Agent "Backups + delta transfer" completed</summary>
+<result>All green. Here is the complete summary.
+
+---
+
+## What was done
+
+### Feature 1: Conflict-loser backups
+
+**Files changed:**
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/syncengine/state.go` — added `var ConflictDir = ""` and `resolvedConflictDir()` (parallel to `StateDir`/`resolvedStateDir()`; in production yields `~/.config/caravan/conflicts`)
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/syncengine/sync.go` — major additions:
+  - `SyncStats.ConflictBackups int` field
+  - `applyActions` signature gains `syncName string, deltaThreshold int64`; conflict actions now record losers in a map before executing, then call `backupLocalLoser`/`backupRemoteLoser` at the right moment (pre-delete for type-flips, before the push/pull batch for file conflicts)
+  - `backupLocalLoser(syncName, localRoot, rel)` — `cp -R` for dirs, `copyFile` for files; destination is `&lt;ConflictDir&gt;/&lt;syncName&gt;/&lt;flattenPath(rel)&gt;.&lt;unixtimestamp&gt;`
+  - `backupRemoteLoser(syncName, remote, rel)` — for `local:` transport copies into local ConflictDir; for SSH runs `mkdir -p ~/.config/caravan/conflicts/&lt;name&gt; &amp;&amp; cp -pR &lt;src&gt; &lt;dst&gt;` over ssh
+  - `flattenPath(rel)` — replaces `/` with `__` to avoid deep remote dir trees
+  - `pruneConflictBackups(syncName)` — called at start of each sync; deletes entries in the conflict dir older than 7 days (best-effort, silent)
+  - After sync, if `stats.ConflictBackups &gt; 0`: prints `conflict backups in ~/.config/caravan/conflicts/&lt;name&gt;/ (N)`
+
+**Tests added** (in `sync_test.go`):
+- `TestConflictBackup_PullWins` — remote wins, local file backed up with its pre-overwrite content
+- `TestConflictBackup_PushWins` — local wins, remote file backed up
+- `TestConflictBackup_TypeFlip_DirLoser` — remote dir type-flip wins, local file backed up before OpPreDeleteLocal
+- `TestConflictBackup_Pruning` — synthetic 8-day-old backup file is removed on next sync pass
+
+### Feature 2: rsync delta transfer for large files
+
+**Files changed:**
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/manifest/manifest.go` — `Sync` struct gains `DeltaMinBytes int64 \`toml:"delta_min_bytes,omitempty"\``, plus `DeltaThreshold() int64` method (0→8 MiB default, -1→MaxInt64/disabled, positive→as-is)
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/syncengine/remote.go` — added:
+  - `rsyncArgs(push bool, host, localPath, remotePath string) []string` — pure function constructing the rsync invocation
+  - `formatRsyncRemotePath(host, remotePath)` — handles `~/`, bare `~`, and absolute paths with correct quoting
+  - `PushDelta(localRoot, paths)` / `PullDelta(localRoot, paths)` — SSH: per-file rsync; `local:`: falls back to `copyFile`/`pushLocal`/`pullLocal` (no benefit from rsync locally)
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/syncengine/sync.go` — `applyActions` now calls `partitionBySize(paths, entries, threshold)` to split push/pull batches; large files go through `PushDelta`/`PullDelta` first, with fallback to tar on failure
+
+**Exact rsync invocation (push, SSH, absolute remote path):**
+```
+rsync -pt -e "ssh -o BatchMode=yes" /local/root/path/to/file.txt user@host:'/remote/root/path/to/file.txt'
+```
+For `~/`-rooted remote paths, double-quotes allow `$HOME` expansion:
+```
+rsync -pt -e "ssh -o BatchMode=yes" /local/path/file.txt user@host:"$HOME/sync/file.txt"
+```
+
+**Tests added:**
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/syncengine/delta_test.go` — `partitionBySize` (basic split, exact threshold, missing entry, all small, empty), `rsyncArgs` (push, pull, `~/` path push/pull, bare `~`), `flattenPath` cases
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/manifest/manifest_test.go` — `TestDeltaThreshold` (all three value cases), `TestDeltaMinBytesRoundTrip` (TOML save/load + omitempty)
+
+### Deviations / uncertainties
+
+1. **`local:` transport and rsync delta**: for `local:` transport, `PushDelta`/`PullDelta` fall back to `copyFile` as specified. Delta is only exercised over SSH.
+2. **Delta threshold applies to push/pull only**: the type-flip flows go through `OpPreDeleteLocal`/`OpPreDeleteRemote` + `OpMkdirLocal`/`OpMkdirRemote` + `OpPush`/`OpPull`; the push/pull actions from those flows end up in `pushPaths`/`pullPaths` and **are** partitioned by size threshold, consistent with the spec.
+3. **Remote rsync fallback**: on per-file rsync failure, the path is appended to `smallPush`/`smallPull` for the tar batch. If the tar batch also fails, it counts as an error (matching the "count an error as today" language in the spec).
+4. **Backup for `OpPreDeleteRemote` type-flips**: the backup is of the remote losing path. For `local:` transport this is a local copy into `ConflictDir`. For SSH this would require fetching the remote content before deletion — the implementation uses `cp -pR` on the remote side into `~/.config/caravan/conflicts/&lt;name&gt;/`, which avoids a round-trip download while preserving the data.</result>
+<usage><subagent_tokens>69710</subagent_tokens><tool_uses>30</tool_uses><duration_ms>291286</duration_ms></usage>
+</task-notification>
