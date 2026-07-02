@@ -1,0 +1,92 @@
+<task-notification>
+<task-id>a150b3b37c3bf880b</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/a150b3b37c3bf880b.output</output-file>
+<status>completed</status>
+<summary>Agent "Implement caravan doctor" completed</summary>
+<result>Here is the complete report.
+
+---
+
+## What was done
+
+**Pre-check:** `go test ./...` was green on all 5 existing packages before any changes.
+
+**Created:** two new files, no existing files modified.
+
+### Files created
+
+| File | Lines | Description |
+|---|---|---|
+| `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/doctor/doctor.go` | 554 | Implementation |
+| `/Users/marlin/fable-experiments/drive-for-devs/caravan/internal/doctor/doctor_test.go` | 613 | Tests (30 cases) |
+
+### Exported API
+
+```go
+// Package-level overrides for tests:
+var StateDirOverride string       // replaces ~/.config/caravan/sync-state
+var LaunchAgentsDirOverride string // replaces ~/Library/LaunchAgents
+var runCmd func(name string, args ...string) ([]byte, error) // exec stub
+
+// Entry point:
+func CmdDoctor(args []string) int  // [-f MANIFEST]; 0=ok, 1=any ✗, 2=usage
+```
+
+### Checks implemented
+
+- **environment (5 rows):** git in PATH (version), ssh in PATH, rsync in PATH (first line), caravan version (buildinfo constant), manifest path + parses
+- **repos (per repo):** dir missing → ✗ "run caravan up"; dir exists, no .git → ~ "occupied"; git repo → ✓
+- **sync/\&lt;name\&gt; (7 rows per entry):** local dir exists; remote — local transport (exists/creatable) or SSH (reachability via `ssh … true`, remote caravan version, remote dir); state file (missing=~, valid=✓ with age, corrupt=✗); lock (flock probe); conflicts dir count (always ✓, informational); daemon plist (stat only, no launchctl)
+- **secrets (2 rows, only if manifest.Secrets.File set):** machine key exists; store decryptable via `secrets.LoadStore`
+
+### Key design decisions / deviations
+
+- **`transportKind` is unexported** in `syncengine/remote.go` — `RemoteConn.Kind` carries an unexported type so it cannot be compared from outside the package. Solution: `parseRemoteTransport` duplicates the small parsing logic locally (string prefix check for `local:`, LastIndex for `:` for SSH) rather than modifying syncengine. `syncengine` is still imported only for the exported `syncengine.StateDir` variable.
+- **SSH ConnectTimeout=5** added to the locally-duplicated `sshDoctorArgs()` (not in syncengine's `sshBaseArgs`) — appropriate for diagnostics, no network hanging.
+- **Remote binary missing** → `~` (warning), not `✗`, as specified; `✗` only if ssh itself is unreachable.
+- **`renderTo` is package-private** but takes a `*tabwriter.Writer` so tests can capture output into a `bytes.Buffer` without touching stdout.
+- **`StateDirOverride`** is a package-level `var` that `resolvedStateDir()` checks first, then `syncengine.StateDir`, then the production default — satisfying the spec's testability requirement without modifying syncengine.
+
+### Test tail (`go test -count=2`)
+
+```
+ok  	caravan/internal/doctor	0.291s
+```
+
+30 tests, all pass twice. Full `go test ./...` still green with no regressions.
+
+### Sample rendered output (from `TestSampleRenderedOutput`)
+
+```
+SECTION      CHECK                   STATUS  DETAIL
+environment  git                     ✓       git version 2.42.0
+environment  ssh                     ✓       OpenSSH_9.0p1
+environment  rsync                   ✓       rsync  version 3.2.7  protocol version 31
+environment  caravan version         ✓       0.4.0
+environment  manifest                ✓       /home/user/.config/caravan/caravan.toml
+repos        api                     ✓       /home/user/projects/api
+repos        frontend                ✗       directory missing — run caravan up
+repos        infra                   ~       /home/user/projects/infra exists but is not a git repo (occupied)
+sync/work    local dir               ✓       /home/user/work
+sync/work    remote reachable        ✓       user@devbox
+sync/work    remote caravan version  ✓       0.4.0
+sync/work    remote dir              ✓       ~/work
+sync/work    state file              ✓       last sync 5m0s ago
+sync/work    lock                    ✓       free
+sync/work    conflicts               ✓       0 backups
+sync/work    daemon plist            -       not installed
+secrets      machine key             ✓       /home/user/.config/caravan/age.key
+secrets      store file              ✓       /home/user/.config/caravan/secrets.enc.json (1 recipient(s), 2 repo(s))
+```
+
+### Wiring note (for the orchestrator)
+
+Add to `main.go`'s switch statement:
+```go
+case "doctor":
+    code = doctor.CmdDoctor(args)
+```
+and import `"caravan/internal/doctor"`. No existing file was modified in this task.</result>
+<usage><subagent_tokens>73848</subagent_tokens><tool_uses>33</tool_uses><duration_ms>450274</duration_ms></usage>
+</task-notification>
