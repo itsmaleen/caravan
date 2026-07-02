@@ -147,6 +147,7 @@ CARAVAN_BIN=$(pwd)/caravan ./test/edge-sync.sh     # 10-round edge-case probe (u
 CARAVAN_BIN=$(pwd)/caravan ./test/stress-sync.sh   # 1000-file cross-device stress/perf
 CARAVAN_BIN=$(pwd)/caravan ./test/topology-sync.sh # 3-replica hub-and-spoke across both machines
 CARAVAN_BIN=$(pwd)/caravan ./test/chaos-sync.sh    # kill -9 mid-transfer, mux drops, corrupt state, 10k files
+CARAVAN_BIN=$(pwd)/caravan ./test/setup-wizard.sh  # agent drives `caravan setup` to a working config (needs claude)
 ```
 
 The e2e script exercises the real two-machine loop: initial push, edits in both
