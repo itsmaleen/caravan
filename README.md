@@ -10,7 +10,8 @@ caravan init          # walk ~/code, discover git repos, draft caravan.toml
 caravan up            # clone/pull every repo, decrypt secrets → .env, mise install
 caravan status        # branch, ahead/behind, dirty, .env, toolchain per repo
 caravan sync          # bidirectional folder sync to another machine over ssh
-caravan sync --watch  # continuous sync (polling)
+caravan sync --watch  # continuous sync (polling, foreground)
+caravan daemon ...    # install | uninstall | status — sync as a launchd service
 caravan secrets ...   # init | set | show | add-machine
 ```
 
@@ -38,11 +39,21 @@ file = "secrets.enc.json"  # age-encrypted, relative to manifest dir
 mise = true                # run `mise install` per repo when mise is on PATH
 
 [[sync]]
-name    = "notes"
-local   = "~/notes"
-remote  = "me@other-mac.tailnet.ts.net:~/notes"   # or "local:/Volumes/usb/notes"
-exclude = ["*.tmp"]        # .git, node_modules, .DS_Store etc. always excluded
+name     = "notes"
+local    = "~/notes"
+remote   = "me@other-mac.tailnet.ts.net:~/notes"  # or "local:/Volumes/usb/notes"
+exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store etc. always excluded
+checksum = false           # true: sha256 change detection (catches edits that
+                           # preserve size+mtime, at the cost of hashing every scan)
 ```
+
+## Continuous sync (daemon)
+
+`caravan daemon install <name> --interval 5s` writes a LaunchAgent that runs
+`caravan sync --watch` for that entry — survives logout/reboot, logs to
+`~/Library/Logs/caravan/<name>.log`. `daemon status` shows plist/running/PID/
+last-sync; `daemon uninstall` removes it. A per-entry lock means a daemon and a
+manual `caravan sync` never race the same state (the loser skips politely).
 
 ## Sync model
 

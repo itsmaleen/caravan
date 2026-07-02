@@ -85,6 +85,18 @@ func doSync(t *testing.T, name, localRoot, remoteSpec string, excludes []string,
 	return runSyncEntry(s, dryRun, false)
 }
 
+// doSyncChecksum is like doSync but enables content-checksum mode.
+func doSyncChecksum(t *testing.T, name, localRoot, remoteSpec string) error {
+	t.Helper()
+	s := manifest.Sync{
+		Name:     name,
+		Local:    localRoot,
+		Remote:   remoteSpec,
+		Checksum: true,
+	}
+	return runSyncEntry(s, false, false)
+}
+
 func t1() time.Time { return time.Unix(1_000_000, 0) }
 func t2() time.Time { return time.Unix(2_000_000, 0) }
 func t3() time.Time { return time.Unix(3_000_000, 0) }
@@ -353,7 +365,7 @@ func TestScanDir_Excludes(t *testing.T) {
 	seedFile(t, root, "src/main.go", "go", t1())
 	seedFile(t, root, "build/out.o", "obj", t1())
 
-	entries, _, err := ScanDir(root, []string{"node_modules", "build"})
+	entries, _, err := ScanDir(root, []string{"node_modules", "build"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +393,7 @@ func TestScanDir_SkipSymlinks(t *testing.T) {
 		t.Skip("symlink creation failed (may need elevated perms):", err)
 	}
 
-	_, symlinks, err := ScanDir(root, nil)
+	_, symlinks, err := ScanDir(root, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -554,4 +566,98 @@ func TestIntegration_TypeFlip_RemoteFileToDir(t *testing.T) {
 	assertFile(t, sideA, "flip/inner.txt", "inside remote dir")
 	assertDir(t, sideB, "flip")
 	assertFile(t, sideB, "flip/inner.txt", "inside remote dir")
+}
+
+// --- checksum-mode integration tests ---
+
+// TestIntegration_Checksum_BlindSpot_WithoutChecksum: proves that WITHOUT
+// checksum mode an edit that preserves size and mtime is invisible to the
+// sync engine (the expected blind-spot behaviour).
+func TestIntegration_Checksum_BlindSpot_WithoutChecksum(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed and sync.
+	seedFile(t, sideA, "secret.txt", "original content!", t1())
+	if err := doSync(t, "blind", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertFile(t, sideB, "secret.txt", "original content!")
+
+	// Step 2: rewrite local file with same-SIZE content and force the SAME mtime.
+	// "original content!" is 17 bytes; "xxxxxxxxxxxxxxxxx" is also 17 bytes.
+	newContent := "xxxxxxxxxxxxxxxxx"
+	if len(newContent) != len("original content!") {
+		t.Fatal("test bug: replacement content must be same size")
+	}
+	if err := os.WriteFile(filepath.Join(sideA, "secret.txt"), []byte(newContent), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Force same mtime so the change is invisible to size+mtime detection.
+	if err := os.Chtimes(filepath.Join(sideA, "secret.txt"), t1(), t1()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Step 3: sync WITHOUT checksum → engine must NOT propagate the change.
+	if err := doSync(t, "blind", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	// Remote should still have the original content (blind spot confirmed).
+	assertFile(t, sideB, "secret.txt", "original content!")
+}
+
+// TestIntegration_Checksum_BlindSpot_WithChecksum: same scenario as above but
+// WITH checksum mode enabled — the change MUST be detected and propagated.
+func TestIntegration_Checksum_BlindSpot_WithChecksum(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed and sync with checksum mode.
+	seedFile(t, sideA, "secret.txt", "original content!", t1())
+	if err := doSyncChecksum(t, "cs", sideA, "local:"+sideB); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertFile(t, sideB, "secret.txt", "original content!")
+
+	// Step 2: rewrite with same-size content AND force the same mtime.
+	// "original content!" is 17 bytes; "xxxxxxxxxxxxxxxxx" is also 17 bytes.
+	newContent := "xxxxxxxxxxxxxxxxx"
+	if len(newContent) != len("original content!") {
+		t.Fatal("test bug: replacement content must be same size")
+	}
+	if err := os.WriteFile(filepath.Join(sideA, "secret.txt"), []byte(newContent), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(sideA, "secret.txt"), t1(), t1()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Step 3: sync WITH checksum → hash mismatch is detected → change propagates.
+	if err := doSyncChecksum(t, "cs", sideA, "local:"+sideB); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	assertFile(t, sideB, "secret.txt", newContent)
+}
+
+// TestIntegration_Checksum_NormalEditsStillWork: verify that checksum mode
+// does not break detection of ordinary edits (different size or mtime).
+func TestIntegration_Checksum_NormalEditsStillWork(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	seedFile(t, sideA, "f.txt", "v1", t1())
+	if err := doSyncChecksum(t, "cs2", sideA, "local:"+sideB); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertFile(t, sideB, "f.txt", "v1")
+
+	// Normal edit with a newer mtime (size also changes).
+	seedFile(t, sideA, "f.txt", "v2 — longer content now", t2())
+	if err := doSyncChecksum(t, "cs2", sideA, "local:"+sideB); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	assertFile(t, sideB, "f.txt", "v2 — longer content now")
 }

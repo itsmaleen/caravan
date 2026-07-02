@@ -58,28 +58,29 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 // --- Scan ---
 
 // Scan returns an Entry map for the remote root, applying excludes.
+// When hashFiles is true, file content hashes are computed on the remote side.
 // For SSH transport it invokes `caravan scan --json` on the remote; on scan
 // failure that looks like a missing binary it attempts to bootstrap the remote
 // and retries once.
-func (r *RemoteConn) Scan(excludes []string) (map[string]Entry, error) {
+func (r *RemoteConn) Scan(excludes []string, hashFiles bool) (map[string]Entry, error) {
 	switch r.Kind {
 	case transportLocal:
-		return r.scanLocal(excludes)
+		return r.scanLocal(excludes, hashFiles)
 	case transportSSH:
-		return r.scanSSH(excludes, true)
+		return r.scanSSH(excludes, hashFiles, true)
 	}
 	return nil, fmt.Errorf("unknown transport kind %d", r.Kind)
 }
 
-func (r *RemoteConn) scanLocal(excludes []string) (map[string]Entry, error) {
+func (r *RemoteConn) scanLocal(excludes []string, hashFiles bool) (map[string]Entry, error) {
 	if err := os.MkdirAll(r.Root, 0o755); err != nil {
 		return nil, fmt.Errorf("local remote mkdir %s: %w", r.Root, err)
 	}
-	entries, _, err := ScanDir(r.Root, excludes)
+	entries, _, err := ScanDir(r.Root, excludes, hashFiles)
 	return entries, err
 }
 
-func (r *RemoteConn) scanSSH(excludes []string, allowBootstrap bool) (map[string]Entry, error) {
+func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap bool) (map[string]Entry, error) {
 	excArg := strings.Join(excludes, ",")
 	remotePath := shellRemotePath(r.Root)
 	var cmd string
@@ -87,6 +88,9 @@ func (r *RemoteConn) scanSSH(excludes []string, allowBootstrap bool) (map[string
 		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json --exclude %q %s`, excArg, remotePath)
 	} else {
 		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json %s`, remotePath)
+	}
+	if hashFiles {
+		cmd += " --hash"
 	}
 
 	out, err := exec.Command("ssh", "-o", "BatchMode=yes", r.Host, cmd).Output()
@@ -98,12 +102,12 @@ func (r *RemoteConn) scanSSH(excludes []string, allowBootstrap bool) (map[string
 			}
 			// Also ensure the remote root exists.
 			_ = r.mkdirSSH("")
-			return r.scanSSH(excludes, false)
+			return r.scanSSH(excludes, hashFiles, false)
 		}
 		// Try to create the remote root if it doesn't exist and retry once.
 		if allowBootstrap && looksLikeMissingDir(err, out) {
 			_ = r.mkdirSSH("")
-			return r.scanSSH(excludes, false)
+			return r.scanSSH(excludes, hashFiles, false)
 		}
 		return nil, fmt.Errorf("remote scan on %s: %w", r.Host, err)
 	}
@@ -125,7 +129,7 @@ func (r *RemoteConn) scanSSH(excludes []string, allowBootstrap bool) (map[string
 			if berr := r.bootstrap(); berr != nil {
 				fmt.Fprintf(os.Stderr, "caravan: version update failed: %v; proceeding\n", berr)
 			} else {
-				return r.scanSSH(excludes, false)
+				return r.scanSSH(excludes, hashFiles, false)
 			}
 		} else {
 			fmt.Fprintf(os.Stderr, "caravan: remote version still mismatched after bootstrap; proceeding\n")
@@ -144,7 +148,13 @@ func looksLikeMissingBinary(err error, out []byte) bool {
 			return true
 		}
 		combined := strings.ToLower(string(ee.Stderr) + string(out))
-		return strings.Contains(combined, "not found") || strings.Contains(combined, "no such file")
+		// "flag provided but not defined": the remote binary is an older
+		// version that lacks a flag we now send (e.g. --hash) — it needs the
+		// same re-push as a missing binary, and the version handshake can't
+		// catch this case because the scan never succeeds.
+		return strings.Contains(combined, "not found") ||
+			strings.Contains(combined, "no such file") ||
+			strings.Contains(combined, "flag provided but not defined")
 	}
 	return false
 }

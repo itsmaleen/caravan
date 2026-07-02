@@ -45,10 +45,11 @@ type Toolchain struct {
 }
 
 type Sync struct {
-	Name    string   `toml:"name"`
-	Local   string   `toml:"local"`
-	Remote  string   `toml:"remote"`
-	Exclude []string `toml:"exclude,omitempty"`
+	Name     string   `toml:"name"`
+	Local    string   `toml:"local"`
+	Remote   string   `toml:"remote"`
+	Exclude  []string `toml:"exclude,omitempty"`
+	Checksum bool     `toml:"checksum,omitempty"`
 }
 
 // DefaultExcludes are applied to every sync folder in addition to its own list.

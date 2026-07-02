@@ -21,6 +21,8 @@ Usage:
   caravan secrets <init|set|show|add-machine> [...]     manage encrypted secrets sidecar
   caravan sync [NAME] [--watch] [--interval 2s] [--dry-run] [--bootstrap] [-f MANIFEST]
                                                         bidirectional folder sync (ssh or local:)
+  caravan daemon <install|uninstall|status> [NAME] [--interval 5s] [-f MANIFEST]
+                                                        run sync continuously via launchd (macOS)
   caravan scan --json DIR [--exclude a,b]               (internal) emit dir state as JSON
   caravan version                                       print version
 
@@ -44,6 +46,8 @@ func main() {
 		code = secrets.CmdSecrets(args)
 	case "sync":
 		code = syncengine.CmdSync(args)
+	case "daemon":
+		code = syncengine.CmdDaemon(args)
 	case "scan":
 		code = syncengine.CmdScan(args)
 	case "version", "--version", "-v":

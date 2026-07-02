@@ -223,3 +223,49 @@ func TestRepoDirCustomPath(t *testing.T) {
 		t.Errorf("RepoDir = %q, want /workspace/sub/hello", got)
 	}
 }
+
+// TestSyncChecksumRoundTrip verifies that the Checksum field on [[sync]] entries
+// survives a Save→Load round-trip and that omitempty keeps it out of the TOML
+// when false.
+func TestSyncChecksumRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "caravan.toml")
+
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: "~/code"},
+		Sync: []manifest.Sync{
+			{Name: "with-cs", Local: "~/a", Remote: "h:~/a", Checksum: true},
+			{Name: "without-cs", Local: "~/b", Remote: "h:~/b", Checksum: false},
+		},
+	}
+
+	if err := manifest.Save(path, m); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(got.Sync) != 2 {
+		t.Fatalf("Sync len: got %d want 2", len(got.Sync))
+	}
+	if !got.Sync[0].Checksum {
+		t.Errorf("Sync[0].Checksum: got false, want true")
+	}
+	if got.Sync[1].Checksum {
+		t.Errorf("Sync[1].Checksum: got true, want false")
+	}
+
+	// Verify omitempty: the TOML file must not contain "checksum" for the false entry.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	content := string(raw)
+	if !strings.Contains(content, "checksum = true") {
+		t.Errorf("expected 'checksum = true' in TOML output:\n%s", content)
+	}
+}

@@ -30,10 +30,16 @@ type Action struct {
 // Plan is a pure function that computes the actions needed to synchronise local
 // and remote given the base (last-known-good mutual snapshot).
 //
+// When useHash is true, change detection for regular files uses hash inequality
+// instead of size/mtime comparisons (dirs always use size/mtime).  A non-empty
+// Hash field in BaseEntry and Entry is required for hash-based detection to
+// engage; if either hash is absent the comparison falls back to size/mtime.
+//
 // Three-way diff rules (per path, union of all three maps):
 //   - new on local only → push / mkdirRemote
 //   - new on remote only → pull / mkdirLocal
 //   - both new (conflict) → newer mtime wins; tie → local
+//   - both new, useHash, same hash, neither is dir → contents identical → no action
 //   - in base, local deleted, remote unchanged → deleteRemote
 //   - in base, remote deleted, local unchanged → deleteLocal
 //   - in base, local deleted, remote modified → pull (modification wins)
@@ -45,7 +51,7 @@ type Action struct {
 //
 // Actions are returned sorted: mkdirs (shallow first), then push/pull,
 // then deletes (deepest first).
-func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
+func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash bool) []Action {
 	// Collect the union of all known paths.
 	paths := make(map[string]struct{}, len(local)+len(remote)+len(base))
 	for p := range base {
@@ -65,8 +71,10 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
 		l, hasLocal := local[p]
 		r, hasRemote := remote[p]
 
-		localModified := hasLocal && hasBase && (l.Size != b.LSize || l.Mtime != b.LMtime)
-		remoteModified := hasRemote && hasBase && (r.Size != b.RSize || r.Mtime != b.RMtime)
+		// Determine per-entry modification using hash when available, falling
+		// back to size/mtime for dirs or when hash data is absent.
+		localModified := hasLocal && hasBase && fileModified(l, b.LSize, b.LMtime, b.Hash, useHash && !l.IsDir)
+		remoteModified := hasRemote && hasBase && fileModified(r, b.RSize, b.RMtime, b.Hash, useHash && !r.IsDir)
 
 		// Type-conflict branch: same path exists on both sides but as different types.
 		// This takes precedence over all other switch cases.
@@ -152,6 +160,11 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
 			// Both new (same path added on both sides simultaneously) — conflict.
 			if l.IsDir && r.IsDir {
 				// Dir exists on both sides; no content conflict.
+				break
+			}
+			// Hash-based shortcut: if both sides carry a hash and they agree,
+			// the content is identical — treat as already in sync, no action.
+			if useHash && !l.IsDir && !r.IsDir && l.Hash != "" && r.Hash != "" && l.Hash == r.Hash {
 				break
 			}
 			if l.Mtime >= r.Mtime {
@@ -329,6 +342,16 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry) []Action {
 	}
 
 	return sortActions(actions)
+}
+
+// fileModified reports whether e differs from the recorded base (bSize, bMtime, bHash).
+// When useHash is true and both e.Hash and bHash are non-empty, hash inequality is
+// used as the change signal.  Otherwise size/mtime comparison is used.
+func fileModified(e Entry, bSize, bMtime int64, bHash string, useHash bool) bool {
+	if useHash && e.Hash != "" && bHash != "" {
+		return e.Hash != bHash
+	}
+	return e.Size != bSize || e.Mtime != bMtime
 }
 
 // sortActions orders actions so they can be applied safely:

@@ -77,6 +77,7 @@ func TestPlanFreshBothEmpty(t *testing.T) {
 		map[string]BaseEntry{},
 		map[string]Entry{},
 		map[string]Entry{},
+		false,
 	)
 	if len(actions) != 0 {
 		t.Errorf("expected no actions, got %v", actions)
@@ -92,6 +93,7 @@ func TestPlanFreshPushAll(t *testing.T) {
 			"b.txt": fe(200, 2000),
 		},
 		map[string]Entry{},
+		false,
 	)
 	checkActions(t, actions, wantOps(
 		OpPush, "a.txt",
@@ -107,6 +109,7 @@ func TestPlanFreshPullAll(t *testing.T) {
 		map[string]Entry{
 			"x.txt": fe(50, 500),
 		},
+		false,
 	)
 	checkActions(t, actions, wantOps(OpPull, "x.txt"))
 }
@@ -117,7 +120,7 @@ func TestPlanModifyLocal(t *testing.T) {
 	}
 	local := map[string]Entry{"f.txt": fe(110, 2000)}  // changed
 	remote := map[string]Entry{"f.txt": fe(100, 1000)} // unchanged
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPush, "f.txt"))
 }
 
@@ -127,7 +130,7 @@ func TestPlanModifyRemote(t *testing.T) {
 	}
 	local := map[string]Entry{"f.txt": fe(100, 1000)}  // unchanged
 	remote := map[string]Entry{"f.txt": fe(110, 2000)} // changed
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPull, "f.txt"))
 }
 
@@ -138,7 +141,7 @@ func TestPlanConflictNewerWins(t *testing.T) {
 	// Remote is newer.
 	local := map[string]Entry{"f.txt": fe(110, 2000)}
 	remote := map[string]Entry{"f.txt": fe(120, 3000)}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPull, "f.txt")) // remote newer
 }
 
@@ -149,7 +152,7 @@ func TestPlanConflictTieLocalWins(t *testing.T) {
 	// Same mtime → local wins.
 	local := map[string]Entry{"f.txt": fe(110, 5000)}
 	remote := map[string]Entry{"f.txt": fe(120, 5000)}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPush, "f.txt"))
 }
 
@@ -160,7 +163,7 @@ func TestPlanDeleteLocalPropagates(t *testing.T) {
 	}
 	local := map[string]Entry{}
 	remote := map[string]Entry{"f.txt": fe(100, 1000)}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpDeleteRemote, "f.txt"))
 }
 
@@ -171,7 +174,7 @@ func TestPlanDeleteRemotePropagates(t *testing.T) {
 	}
 	local := map[string]Entry{"f.txt": fe(100, 1000)}
 	remote := map[string]Entry{}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpDeleteLocal, "f.txt"))
 }
 
@@ -182,7 +185,7 @@ func TestPlanDeleteVsModify_DeleteLocalModifyRemote(t *testing.T) {
 	}
 	local := map[string]Entry{}
 	remote := map[string]Entry{"f.txt": fe(110, 2000)} // modified
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPull, "f.txt"))
 }
 
@@ -193,7 +196,7 @@ func TestPlanDeleteVsModify_DeleteRemoteModifyLocal(t *testing.T) {
 	}
 	local := map[string]Entry{"f.txt": fe(110, 2000)} // modified
 	remote := map[string]Entry{}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPush, "f.txt"))
 }
 
@@ -202,7 +205,7 @@ func TestPlanNewSamePathBothSides_RemoteNewer(t *testing.T) {
 	base := map[string]BaseEntry{}
 	local := map[string]Entry{"f.txt": fe(100, 1000)}
 	remote := map[string]Entry{"f.txt": fe(200, 2000)}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPull, "f.txt")) // remote newer
 }
 
@@ -210,7 +213,7 @@ func TestPlanNewSamePathBothSides_LocalNewer(t *testing.T) {
 	base := map[string]BaseEntry{}
 	local := map[string]Entry{"f.txt": fe(100, 3000)}
 	remote := map[string]Entry{"f.txt": fe(200, 2000)}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpPush, "f.txt")) // local newer
 }
 
@@ -219,7 +222,7 @@ func TestPlanEmptyDirs(t *testing.T) {
 	base := map[string]BaseEntry{}
 	local := map[string]Entry{"emptydir": de(1000)}
 	remote := map[string]Entry{}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(OpMkdirRemote, "emptydir"))
 }
 
@@ -233,7 +236,7 @@ func TestPlanNestedDirs(t *testing.T) {
 		"a/b/f.txt": fe(10, 100),
 	}
 	remote := map[string]Entry{}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 
 	// Expect mkdirRemote for all dirs (shallow before deep) then push for file.
 	if len(actions) != 4 {
@@ -271,7 +274,7 @@ func TestPlanDeleteDirsDeepestFirst(t *testing.T) {
 		"a/b":   de(2),
 		"a/b/f": fe(10, 3),
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	// Expect: deleteRemote for a/b/f, a/b, a (deepest first for dirs)
 	// File delete comes before dir delete.
 	fileIdx := -1
@@ -321,7 +324,7 @@ func TestPlanInSync(t *testing.T) {
 		"f.txt": fe(100, 1000),
 		"g.txt": fe(200, 2000),
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	if len(actions) != 0 {
 		t.Errorf("expected no actions when in sync, got %v", actions)
 	}
@@ -339,7 +342,7 @@ func TestPlanOrderMkdirBeforePushBeforeDelete(t *testing.T) {
 	remote := map[string]Entry{
 		"old.txt": fe(10, 100),
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	// Expect: mkdirRemote(newdir), push(newdir/n.txt), deleteRemote(old.txt)
 	if len(actions) != 3 {
 		t.Fatalf("expected 3 actions, got %d: %v", len(actions), actions)
@@ -379,7 +382,7 @@ func TestPlanTypeConflict_FileToDir_LocalFlip_WithBase(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": fe(100, 1000), // still the file remotely (unchanged)
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteRemote, "flip",
 		OpMkdirRemote, "flip",
@@ -409,7 +412,7 @@ func TestPlanTypeConflict_DirToFile_LocalFlip_WithBase(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": de(1000), // still a dir remotely (unchanged)
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteRemote, "flip",
 		OpPush, "flip",
@@ -434,7 +437,7 @@ func TestPlanTypeConflict_RemoteFlip_WithBase(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": de(2000), // now a dir remotely
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteLocal, "flip",
 		OpMkdirLocal, "flip",
@@ -460,7 +463,7 @@ func TestPlanTypeConflict_NoBase_LocalNewer(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": de(1000), // remote dir, older
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteRemote, "flip",
 		OpPush, "flip",
@@ -477,7 +480,7 @@ func TestPlanTypeConflict_NoBase_RemoteNewer(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": fe(50, 3000), // remote file, newer
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteLocal, "flip",
 		OpPull, "flip",
@@ -493,7 +496,7 @@ func TestPlanTypeConflict_NoBase_Tie(t *testing.T) {
 	remote := map[string]Entry{
 		"flip": de(2000), // remote dir, same mtime
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	checkActions(t, actions, wantOps(
 		OpPreDeleteRemote, "flip",
 		OpPush, "flip",
@@ -513,7 +516,7 @@ func TestPlanTypeConflict_ChildSuppression_LocalFileWinsOverRemoteDir(t *testing
 		"flip/child":   de(1000),           // remote dir child
 		"flip/child/f": fe(10, 1000),       // remote file grandchild
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	// Expect: preDeleteRemote(flip) + push(flip).
 	// Children under flip/ must be suppressed (no pull/mkdirLocal for them).
 	checkActions(t, actions, wantOps(
@@ -534,7 +537,7 @@ func TestPlanTypeConflict_ChildSuppression_LocalDirWinsOverRemoteFile(t *testing
 	remote := map[string]Entry{
 		"flip": fe(50, 1000), // remote file, loses
 	}
-	actions := Plan(base, local, remote)
+	actions := Plan(base, local, remote, false)
 	// Expect: preDeleteRemote(flip) + mkdirRemote(flip) + push(flip/child).
 	checkActions(t, actions, wantOps(
 		OpPreDeleteRemote, "flip",
@@ -550,5 +553,112 @@ func TestPlanTypeConflict_ChildSuppression_LocalDirWinsOverRemoteFile(t *testing
 	}
 	if actions[2].Op != OpPush {
 		t.Errorf("action[2] should be push, got %s", actions[2].Op)
+	}
+}
+
+// --- hash-mode planner unit tests ---
+
+// feH creates an Entry with size, mtime and a hash (for hash-mode testing).
+func feH(size int64, mtime int64, hash string) Entry {
+	return Entry{Size: size, Mtime: mtime, Mode: 0o644, Hash: hash}
+}
+
+// beH creates a BaseEntry with all size/mtime fields equal and a hash.
+func beH(s, m int64, hash string) BaseEntry {
+	return BaseEntry{LSize: s, LMtime: m, RSize: s, RMtime: m, Hash: hash}
+}
+
+// TestPlanHash_SameSizeMtimeDifferentHash: size and mtime are identical on
+// both sides but hashes differ → change detected → push (local is the "modified" side).
+func TestPlanHash_SameSizeMtimeDifferentHash(t *testing.T) {
+	const hash1 = "aabbcc"
+	const hash2 = "ddeeff"
+	base := map[string]BaseEntry{
+		"f.txt": beH(100, 1000, hash1),
+	}
+	// Local still has same size/mtime as base but a different hash — content changed.
+	local := map[string]Entry{"f.txt": feH(100, 1000, hash2)}
+	remote := map[string]Entry{"f.txt": feH(100, 1000, hash1)} // unchanged
+	actions := Plan(base, local, remote, true)
+	checkActions(t, actions, wantOps(OpPush, "f.txt"))
+}
+
+// TestPlanHash_SameSizeMtimeSameHash: both sides agree on hash → no action
+// even when useHash=true.
+func TestPlanHash_SameSizeMtimeSameHash(t *testing.T) {
+	const hash = "aabbcc"
+	base := map[string]BaseEntry{
+		"f.txt": beH(100, 1000, hash),
+	}
+	local := map[string]Entry{"f.txt": feH(100, 1000, hash)}
+	remote := map[string]Entry{"f.txt": feH(100, 1000, hash)}
+	actions := Plan(base, local, remote, true)
+	if len(actions) != 0 {
+		t.Errorf("expected no actions when hashes match, got %v", actions)
+	}
+}
+
+// TestPlanHash_NoHashFallsBackToSizeMtime: when hash fields are absent,
+// useHash=true must fall back to size/mtime comparison.
+func TestPlanHash_NoHashFallsBackToSizeMtime(t *testing.T) {
+	// Base and entries have no hashes: size+mtime change should still be detected.
+	base := map[string]BaseEntry{
+		"f.txt": be(100, 1000, 100, 1000, false),
+	}
+	local := map[string]Entry{"f.txt": fe(110, 2000)} // size changed, no hash
+	remote := map[string]Entry{"f.txt": fe(100, 1000)}
+	actions := Plan(base, local, remote, true)
+	checkActions(t, actions, wantOps(OpPush, "f.txt"))
+}
+
+// TestPlanHash_BothNewSameHash: both sides present, no base, same hash and
+// different mtime → contents identical → no action.
+func TestPlanHash_BothNewSameHash_DifferentMtime(t *testing.T) {
+	const hash = "cafebabe"
+	base := map[string]BaseEntry{}
+	// Different mtimes but same hash: without checksum mode this would pick a
+	// winner; with checksum mode the identical content means no action.
+	local := map[string]Entry{"f.txt": feH(100, 1000, hash)}
+	remote := map[string]Entry{"f.txt": feH(100, 3000, hash)} // newer mtime
+	actions := Plan(base, local, remote, true)
+	if len(actions) != 0 {
+		t.Errorf("expected no actions when both-new entries have same hash, got %v", actions)
+	}
+}
+
+// TestPlanHash_BothNewDifferentHash_WithoutChecksum: same size/mtime but
+// different hash — WITHOUT checksum mode → no action (size+mtime equal).
+// This is the blind-spot case that checksum mode is designed to catch.
+func TestPlanHash_BlindSpot_WithoutChecksum(t *testing.T) {
+	const hash1 = "aaaa"
+	const hash2 = "bbbb"
+	base := map[string]BaseEntry{
+		"f.txt": beH(100, 1000, hash1),
+	}
+	// Same size and mtime as base but different content.
+	local := map[string]Entry{"f.txt": feH(100, 1000, hash2)}
+	remote := map[string]Entry{"f.txt": feH(100, 1000, hash1)} // unchanged
+	// Without checksum: size+mtime match → no change detected.
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 0 {
+		t.Errorf("expected no actions in size/mtime mode (blind spot), got %v", actions)
+	}
+}
+
+// TestPlanHash_DirIgnoresHash: directory entries always use size/mtime even
+// when useHash=true (dirs have no meaningful content hash).
+func TestPlanHash_DirIgnoresHash(t *testing.T) {
+	// Dir "changed" only in mtime — should still trigger a mkdir-style no-op
+	// (dirs that change only in mtime produce no action per existing logic).
+	base := map[string]BaseEntry{
+		"mydir": {LSize: 0, LMtime: 1000, RSize: 0, RMtime: 1000, Dir: true},
+	}
+	local := map[string]Entry{"mydir": de(2000)} // mtime bumped
+	remote := map[string]Entry{"mydir": de(1000)}
+	// localModified=true (mtime differs), remoteModified=false, but it's a dir
+	// → the "only local changed" dir branch produces no action.
+	actions := Plan(base, local, remote, true)
+	if len(actions) != 0 {
+		t.Errorf("expected no content action for dir-only mtime change, got %v", actions)
 	}
 }

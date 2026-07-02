@@ -2,9 +2,12 @@
 package syncengine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -24,6 +27,7 @@ type Entry struct {
 	Mtime int64  `json:"mtime"` // UnixNano
 	Mode  uint32 `json:"mode"`
 	IsDir bool   `json:"is_dir"`
+	Hash  string `json:"hash,omitempty"` // sha256 hex; only set when hashFiles=true
 }
 
 // ScanResult is the JSON envelope emitted by CmdScan.
@@ -34,9 +38,11 @@ type ScanResult struct {
 
 // ScanDir walks root and returns a map of slash-separated relative path → Entry.
 // excludes patterns are matched against each path segment (base name) using path.Match.
+// When hashFiles is true, a sha256 hex digest is computed for every regular file
+// (streamed, not slurped) and stored in Entry.Hash.
 // Symlinks are skipped; the count of skipped symlinks is returned.
 // Paths containing a single-quote or newline are skipped with a warning.
-func ScanDir(root string, excludes []string) (map[string]Entry, int, error) {
+func ScanDir(root string, excludes []string, hashFiles bool) (map[string]Entry, int, error) {
 	entries := make(map[string]Entry)
 	symlinks := 0
 
@@ -95,16 +101,42 @@ func ScanDir(root string, excludes []string) (map[string]Entry, int, error) {
 			return nil
 		}
 
-		entries[rel] = Entry{
+		e := Entry{
 			Size:  info.Size(),
 			Mtime: info.ModTime().UnixNano(),
 			Mode:  uint32(info.Mode()),
 			IsDir: info.IsDir(),
 		}
+
+		if hashFiles && !info.IsDir() {
+			if h, herr := hashFile(absPath); herr != nil {
+				fmt.Fprintf(os.Stderr, "scan: hash %s: %v\n", absPath, herr)
+			} else {
+				e.Hash = h
+			}
+		}
+
+		entries[rel] = e
 		return nil
 	})
 
 	return entries, symlinks, err
+}
+
+// hashFile computes the sha256 digest of the file at path and returns it as a
+// lowercase hex string.  The file is streamed so large files are not slurped
+// into memory.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // matchesExclude returns true when rel matches any exclude pattern on any segment.
@@ -120,12 +152,13 @@ func matchesExclude(rel string, excludes []string) bool {
 	return false
 }
 
-// CmdScan implements `caravan scan --json DIR [--exclude a,b,c]`.
+// CmdScan implements `caravan scan --json DIR [--exclude a,b,c] [--hash]`.
 func CmdScan(args []string) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	jsonOut := fs.Bool("json", false, "output directory state as JSON (required)")
 	excludeStr := fs.String("exclude", "", "comma-separated exclude patterns")
+	hashFiles := fs.Bool("hash", false, "compute sha256 hash for every regular file")
 
 	positionals, err := cliargs.ParseAnywhere(fs, args)
 	if err != nil {
@@ -153,7 +186,7 @@ func CmdScan(args []string) int {
 
 	dir := manifest.ExpandPath(positionals[0])
 
-	result, symlinks, err := ScanDir(dir, excludes)
+	result, symlinks, err := ScanDir(dir, excludes, *hashFiles)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scan: %v\n", err)
 		return 1

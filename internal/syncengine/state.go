@@ -29,9 +29,11 @@ func statePath(name string) string {
 }
 
 // BaseEntry records what each side looked like after the last successful sync
-// for a single path.  Hash is unused in v0.1 but kept for forward compatibility.
+// for a single path.  Hash (sha256 hex) is populated when checksum mode is
+// enabled; after a successful sync both sides have identical content so a
+// single hash suffices.
 type BaseEntry struct {
-	Hash   string `json:"hash"`
+	Hash   string `json:"hash,omitempty"`
 	LSize  int64  `json:"lsize"`
 	LMtime int64  `json:"lmtime"`
 	RSize  int64  `json:"rsize"`

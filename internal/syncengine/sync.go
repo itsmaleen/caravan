@@ -1,6 +1,7 @@
 package syncengine
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -116,6 +117,20 @@ func CmdSync(args []string) int {
 // runSyncEntry runs one sync pass for a single [[sync]] entry. In quiet mode
 // (watch loop) an in-sync pass prints nothing.
 func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
+	release, lockErr := AcquireSyncLock(s.Name)
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrSyncBusy) {
+			// Another caravan process (daemon or manual run) owns this entry
+			// right now; skipping is the correct behavior, not an error state.
+			if !quiet {
+				fmt.Printf("- %s skipped: %v\n", s.Name, lockErr)
+			}
+			return nil
+		}
+		return lockErr
+	}
+	defer release()
+
 	localRoot := manifest.ExpandPath(s.Local)
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
 		return fmt.Errorf("mkdir local %s: %w", localRoot, err)
@@ -129,13 +144,13 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	excludes := s.Excludes()
 
 	// Scan local.
-	localEntries, _, err := ScanDir(localRoot, excludes)
+	localEntries, _, err := ScanDir(localRoot, excludes, s.Checksum)
 	if err != nil {
 		return fmt.Errorf("local scan: %w", err)
 	}
 
 	// Scan remote (creates remote root if needed).
-	remoteEntries, err := remote.Scan(excludes)
+	remoteEntries, err := remote.Scan(excludes, s.Checksum)
 	if err != nil {
 		return fmt.Errorf("remote scan: %w", err)
 	}
@@ -147,7 +162,7 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	}
 
 	// Plan.
-	actions := Plan(state.Pairs, localEntries, remoteEntries)
+	actions := Plan(state.Pairs, localEntries, remoteEntries, s.Checksum)
 
 	if len(actions) == 0 {
 		if !quiet {
@@ -168,8 +183,8 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	stats, applyErr := applyActions(actions, localRoot, remote, localEntries, remoteEntries)
 
 	// Rescan both sides to build the new authoritative base.
-	newLocal, _, _ := ScanDir(localRoot, excludes)
-	newRemote, _ := remote.Scan(excludes)
+	newLocal, _, _ := ScanDir(localRoot, excludes, s.Checksum)
+	newRemote, _ := remote.Scan(excludes, s.Checksum)
 	newBase := buildBase(newLocal, newRemote)
 
 	newState := &State{
@@ -334,11 +349,20 @@ func applyActions(
 // buildBase constructs a new base from the intersection of post-apply local and
 // remote scans.  Only paths present on BOTH sides are recorded; a path missing
 // on one side means the transfer failed and should be retried next run.
+//
+// Hash is taken from the local entry when present (after a successful sync both
+// sides have identical content, so either hash would be equivalent); if local
+// has no hash the remote hash is used as a fallback.
 func buildBase(local, remote map[string]Entry) map[string]BaseEntry {
 	base := make(map[string]BaseEntry, len(local))
 	for p, l := range local {
 		if r, ok := remote[p]; ok {
+			hash := l.Hash
+			if hash == "" {
+				hash = r.Hash
+			}
 			base[p] = BaseEntry{
+				Hash:   hash,
 				LSize:  l.Size,
 				LMtime: l.Mtime,
 				RSize:  r.Size,
