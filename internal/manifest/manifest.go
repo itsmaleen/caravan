@@ -71,7 +71,7 @@ func (s Sync) DeltaThreshold() int64 {
 }
 
 // DefaultExcludes are applied to every sync folder in addition to its own list.
-var DefaultExcludes = []string{".git", "node_modules", ".DS_Store", "dist", "target", ".next", ".cache"}
+var DefaultExcludes = []string{".git", "node_modules", ".DS_Store", "dist", "target", ".next", ".cache", ".caravan-staging"}
 
 // ExpandPath expands a leading "~/" (or bare "~") to the user home directory.
 func ExpandPath(s string) string {

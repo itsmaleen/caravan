@@ -775,24 +775,39 @@ func pruneConflictBackups(syncName string) {
 // Hash is taken from the local entry when present (after a successful sync both
 // sides have identical content, so either hash would be equivalent); if local
 // has no hash the remote hash is used as a fallback.
+//
+// Size-mismatch guard: when both entries are files and their sizes differ, the
+// path is NOT recorded in the base.  This prevents a truncated file left by an
+// interrupted tar extraction from being blessed as "in sync" — on the next run
+// the planner will see a divergence and re-reconcile it.  Directories are
+// always recorded regardless of any size field.
 func buildBase(local, remote map[string]Entry) map[string]BaseEntry {
 	base := make(map[string]BaseEntry, len(local))
 	for p, l := range local {
-		if r, ok := remote[p]; ok {
-			hash := l.Hash
-			if hash == "" {
-				hash = r.Hash
-			}
-			base[p] = BaseEntry{
-				Hash:   hash,
-				LSize:  l.Size,
-				LMtime: l.Mtime,
-				RSize:  r.Size,
-				RMtime: r.Mtime,
-				Dir:    l.IsDir || r.IsDir,
-				LMode:  l.Mode & 0o777,
-				RMode:  r.Mode & 0o777,
-			}
+		r, ok := remote[p]
+		if !ok {
+			continue
+		}
+		// Skip file pairs whose sizes disagree — at least one side is partial.
+		if !l.IsDir && !r.IsDir && l.Size != r.Size {
+			fmt.Fprintf(os.Stderr,
+				"sync: base: skipping %s (size mismatch local=%d remote=%d — will re-reconcile)\n",
+				p, l.Size, r.Size)
+			continue
+		}
+		hash := l.Hash
+		if hash == "" {
+			hash = r.Hash
+		}
+		base[p] = BaseEntry{
+			Hash:   hash,
+			LSize:  l.Size,
+			LMtime: l.Mtime,
+			RSize:  r.Size,
+			RMtime: r.Mtime,
+			Dir:    l.IsDir || r.IsDir,
+			LMode:  l.Mode & 0o777,
+			RMode:  r.Mode & 0o777,
 		}
 	}
 	return base

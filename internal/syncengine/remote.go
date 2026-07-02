@@ -401,6 +401,34 @@ func (r *RemoteConn) pushLocal(localRoot string, paths []string) error {
 	return nil
 }
 
+// stagedExtractScript returns a POSIX shell script that atomically extracts a
+// tar stream (read from stdin) into rootExpr by staging into a temp dir first.
+// rootExpr must already be a properly quoted shell expression (e.g. the output
+// of shellRemotePath).  Steps are joined with && so any failure aborts before
+// the move phase, preventing partial writes from landing in the live tree.
+//
+// Algorithm:
+//  1. Wipe any leftover staging dir from a previous interrupted run.
+//  2. Create the staging dir.
+//  3. Extract the tar stream into staging.
+//  4. Move each file from staging into the real root (creating parent dirs as needed).
+//  5. Remove the now-empty staging dir.
+//
+// Empty directories produced by tar (unusual in this engine — dirs are mkdir'd
+// separately) are ignored; only regular files are moved.
+func stagedExtractScript(rootExpr string) string {
+	// rootExpr is already shell-quoted (e.g. "$HOME/foo" or "/abs/path").
+	// We need a raw string for path concatenation inside the script.  We build
+	// the script using a here-doc style so quoting is explicit and testable.
+	return `root=` + rootExpr + ` && ` +
+		`rm -rf "${root}/.caravan-staging" && ` +
+		`mkdir -p "${root}/.caravan-staging" && ` +
+		`tar -C "${root}/.caravan-staging" -xpf - && ` +
+		`cd "${root}/.caravan-staging" && ` +
+		`find . -type f -print0 | while IFS= read -r -d '' f; do mkdir -p "${root}/$(dirname "$f")"; mv -f "$f" "${root}/$f"; done && ` +
+		`cd / && rm -rf "${root}/.caravan-staging"`
+}
+
 func (r *RemoteConn) pushSSH(localRoot string, paths []string) error {
 	// Write the file list to a temp file.
 	tmpList, err := os.CreateTemp("", "caravan-push-*")
@@ -419,7 +447,7 @@ func (r *RemoteConn) pushSSH(localRoot string, paths []string) error {
 	}
 
 	remoteRoot := shellRemotePath(r.Root)
-	sshScript := fmt.Sprintf(`mkdir -p %s && tar -C %s -xpf -`, remoteRoot, remoteRoot)
+	sshScript := fmt.Sprintf(`mkdir -p %s && %s`, remoteRoot, stagedExtractScript(remoteRoot))
 
 	tarCmd := exec.Command("tar", "-C", localRoot, "-cf", "-", "-T", tmpList.Name())
 	sshCmd := sshCommand(r.Host, sshScript)
@@ -499,11 +527,22 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 		remoteRoot, os.Getpid(), os.Getpid(), os.Getpid(),
 	)
 
+	stagingDir := filepath.Join(localRoot, ".caravan-staging")
+
+	// Remove any leftover staging dir from a previous interrupted run.
+	if err := os.RemoveAll(stagingDir); err != nil {
+		return fmt.Errorf("ssh pull: remove old staging: %w", err)
+	}
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return fmt.Errorf("ssh pull: mkdir staging: %w", err)
+	}
+
 	sshCmd := sshCommand(r.Host, sshScript)
 	sshCmd.Stdin = strings.NewReader(listData)
 	sshCmd.Stderr = os.Stderr
 
-	tarCmd := exec.Command("tar", "-C", localRoot, "-xpf", "-")
+	// Extract into the staging dir — not the live tree.
+	tarCmd := exec.Command("tar", "-C", stagingDir, "-xpf", "-")
 	tarCmd.Stderr = os.Stderr
 
 	pr, pw := io.Pipe()
@@ -511,6 +550,7 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 	tarCmd.Stdin = pr
 
 	if err := tarCmd.Start(); err != nil {
+		os.RemoveAll(stagingDir) //nolint
 		return fmt.Errorf("ssh pull: start tar: %w", err)
 	}
 
@@ -527,10 +567,40 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 	wg.Wait()
 
 	if tarErr != nil {
+		os.RemoveAll(stagingDir) //nolint
 		return fmt.Errorf("ssh pull tar: %w", tarErr)
 	}
 	if sshErr != nil {
+		os.RemoveAll(stagingDir) //nolint
 		return fmt.Errorf("ssh pull: %w", sshErr)
+	}
+
+	// Tar succeeded: walk staging and move each file atomically into the live tree.
+	moveErr := filepath.WalkDir(stagingDir, func(srcPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(stagingDir, srcPath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			// Ensure the directory exists in the live tree (create, don't move).
+			return os.MkdirAll(filepath.Join(localRoot, rel), 0o755)
+		}
+		dst := filepath.Join(localRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.Rename(srcPath, dst)
+	})
+
+	os.RemoveAll(stagingDir) //nolint
+	if moveErr != nil {
+		return fmt.Errorf("ssh pull: stage move: %w", moveErr)
 	}
 	return nil
 }
@@ -753,12 +823,13 @@ func (r *RemoteConn) chmodSSH(pairs []ChmodPair) error {
 
 // --- Helpers ---
 
-// copyFile copies src to dst, preserving mode and mtime.
+// copyFile copies src to dst atomically, preserving mode and mtime.
 //
-// On a fresh create, os.OpenFile with info.Mode() sets the correct
-// permissions.  On an overwrite (O_TRUNC of an existing file), the kernel
-// keeps the old file's permissions; we call os.Chmod explicitly afterwards
-// so the destination always reflects the source's permission bits.
+// The content is written to dst+".caravan-tmp" first; the file is then
+// chmod'd to the source's permission bits and renamed over dst.  Because
+// rename(2) is atomic on the same filesystem, an interrupted copy never
+// leaves a truncated file in place at dst.  The temp file is removed on
+// any error path.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -771,25 +842,36 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+	tmp := dst + ".caravan-tmp"
+
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
 	if err != nil {
 		return err
 	}
 
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()
+		os.Remove(tmp) //nolint
 		return err
 	}
 	if err := out.Close(); err != nil {
+		os.Remove(tmp) //nolint
 		return err
 	}
 
-	// Explicitly set permissions so that overwriting an existing file with
-	// different mode bits propagates the source's mode (O_TRUNC does not chmod).
-	if err := os.Chmod(dst, info.Mode()); err != nil {
+	// Set permissions on the temp file before rename so the destination
+	// atomically appears with the correct mode.
+	if err := os.Chmod(tmp, info.Mode()); err != nil {
+		os.Remove(tmp) //nolint
 		return err
 	}
 
-	// Preserve mtime.
+	// Atomic rename: dst is never in a partial state.
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp) //nolint
+		return err
+	}
+
+	// Preserve mtime (best-effort; runs after rename so dst is already visible).
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
 }

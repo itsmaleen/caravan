@@ -89,8 +89,10 @@ action. Conflict losers are never destroyed: the overwritten side's
 content is backed up to `~/.config/caravan/conflicts/<entry>/` on whichever
 machine lost (pruned after 7 days). Files above `delta_min_bytes` transfer via
 rsync so a small edit to a large file only moves changed blocks (40 MB file,
-1 KB append: ~1.8 s vs ~12 s full push). `.git` and dependency dirs are
-hard-excluded.
+1 KB append: ~1.8 s vs ~12 s full push). Receives are atomic: tar transfers
+land in a `.caravan-staging` dir and rename into place, so a killed transfer
+can never leave a truncated file in the tree, and the base refuses to record
+size-mismatched pairs. `.git` and dependency dirs are hard-excluded.
 
 The remote side is scanned by running `caravan scan` over ssh. If the binary is
 missing on the remote and the platform matches, caravan copies itself to the
@@ -125,6 +127,7 @@ CARAVAN_BIN=$(pwd)/caravan ./test/e2e-sync.sh      # cross-device e2e (needs ssh
 CARAVAN_BIN=$(pwd)/caravan ./test/edge-sync.sh     # 10-round edge-case probe (unicode, type flips, …)
 CARAVAN_BIN=$(pwd)/caravan ./test/stress-sync.sh   # 1000-file cross-device stress/perf
 CARAVAN_BIN=$(pwd)/caravan ./test/topology-sync.sh # 3-replica hub-and-spoke across both machines
+CARAVAN_BIN=$(pwd)/caravan ./test/chaos-sync.sh    # kill -9 mid-transfer, mux drops, corrupt state, 10k files
 ```
 
 The e2e script exercises the real two-machine loop: initial push, edits in both

@@ -1004,3 +1004,194 @@ func TestConflictBackup_Pruning(t *testing.T) {
 		t.Error("expected old backup file to be pruned, but it still exists")
 	}
 }
+
+// --- Layer 2: buildBase size-mismatch guard ---
+
+// TestBuildBase_SizeMismatch_SkipsFilePair verifies that when both entries are
+// files with different sizes, buildBase does NOT record the path in the base
+// (so the next run re-reconciles it rather than treating it as in-sync).
+func TestBuildBase_SizeMismatch_SkipsFilePair(t *testing.T) {
+	local := map[string]Entry{
+		"good.txt":    {Size: 100, Mtime: t1().UnixNano(), Mode: 0o644},
+		"partial.txt": {Size: 50, Mtime: t1().UnixNano(), Mode: 0o644},  // partial
+	}
+	remote := map[string]Entry{
+		"good.txt":    {Size: 100, Mtime: t1().UnixNano(), Mode: 0o644},
+		"partial.txt": {Size: 200, Mtime: t1().UnixNano(), Mode: 0o644}, // full on remote
+	}
+
+	base := buildBase(local, remote)
+
+	if _, ok := base["good.txt"]; !ok {
+		t.Error("good.txt should be in base (sizes match)")
+	}
+	if _, ok := base["partial.txt"]; ok {
+		t.Error("partial.txt must NOT be in base (size mismatch — truncated file guard)")
+	}
+}
+
+// TestBuildBase_SizeMismatch_DirsUnaffected verifies that directory entries are
+// always recorded in the base regardless of their (meaningless) size field.
+func TestBuildBase_SizeMismatch_DirsUnaffected(t *testing.T) {
+	local := map[string]Entry{
+		"subdir": {Size: 4096, IsDir: true, Mode: 0o755},
+	}
+	remote := map[string]Entry{
+		"subdir": {Size: 0, IsDir: true, Mode: 0o755}, // size differs, but both are dirs
+	}
+
+	base := buildBase(local, remote)
+	if _, ok := base["subdir"]; !ok {
+		t.Error("directory entry must be in base even when sizes differ")
+	}
+	if !base["subdir"].Dir {
+		t.Error("Dir flag must be true for directory entry")
+	}
+}
+
+// TestBuildBase_SizeMismatch_MissingOnOneSide verifies that a path missing on
+// one side (transfer failure) is not in the base — this is the existing behavior
+// and must remain correct alongside the new size-mismatch guard.
+func TestBuildBase_SizeMismatch_MissingOnOneSide(t *testing.T) {
+	local := map[string]Entry{
+		"f.txt": {Size: 10, Mtime: t1().UnixNano()},
+		"g.txt": {Size: 10, Mtime: t1().UnixNano()}, // only on local
+	}
+	remote := map[string]Entry{
+		"f.txt": {Size: 10, Mtime: t1().UnixNano()},
+		// g.txt missing on remote
+	}
+
+	base := buildBase(local, remote)
+	if _, ok := base["f.txt"]; !ok {
+		t.Error("f.txt must be in base (both sides, sizes match)")
+	}
+	if _, ok := base["g.txt"]; ok {
+		t.Error("g.txt must NOT be in base (missing on remote)")
+	}
+}
+
+// --- Staging dir exclusion ---
+
+// TestStagingDir_ExcludedFromScan verifies that .caravan-staging is excluded
+// from ScanDir when DefaultExcludes (as returned by Sync.Excludes()) are used.
+// This matches the actual call site in runSyncEntry.
+func TestStagingDir_ExcludedFromScan(t *testing.T) {
+	root := t.TempDir()
+
+	// Create a normal file and a file inside .caravan-staging.
+	seedFile(t, root, "real.txt", "real content", t1())
+	seedFile(t, root, ".caravan-staging/partial.txt", "partial", t1())
+
+	// Use the effective excludes from a default Sync entry (includes DefaultExcludes).
+	s := manifest.Sync{Name: "x", Local: root, Remote: "local:" + t.TempDir()}
+	excludes := s.Excludes()
+
+	entries, _, err := ScanDir(root, excludes, false)
+	if err != nil {
+		t.Fatalf("ScanDir: %v", err)
+	}
+
+	if _, ok := entries["real.txt"]; !ok {
+		t.Error("real.txt must be present in scan results")
+	}
+	for p := range entries {
+		if strings.HasPrefix(p, ".caravan-staging") {
+			t.Errorf("scan must not include .caravan-staging paths, but found: %s", p)
+		}
+	}
+}
+
+// TestStagingDir_DoesNotPolluteSyncBase verifies the end-to-end property:
+// if .caravan-staging exists in the sync root at scan time, a full sync pass
+// does not include it in either side's entries or the resulting base snapshot.
+func TestStagingDir_DoesNotPolluteSyncBase(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	seedFile(t, sideA, "keep.txt", "good", t1())
+	// Simulate a leftover staging dir in sideA (local side).
+	seedFile(t, sideA, ".caravan-staging/leftovers.txt", "bad", t1())
+
+	if err := doSync(t, "staging-excl", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	assertFile(t, sideB, "keep.txt", "good")
+	assertAbsent(t, sideB, ".caravan-staging/leftovers.txt")
+
+	// Verify state does not record the staging path.
+	state, err := LoadState("staging-excl")
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	for p := range state.Pairs {
+		if strings.HasPrefix(p, ".caravan-staging") {
+			t.Errorf("base snapshot must not contain .caravan-staging paths, got: %s", p)
+		}
+	}
+}
+
+// --- Integration: local: transport with new atomic copyFile path ---
+
+// TestIntegration_AtomicCopy_MultiFileSync exercises push and pull over the
+// local: transport to confirm the atomic copyFile path (tmp+rename) correctly
+// transfers multiple files while preserving content and mode.
+func TestIntegration_AtomicCopy_MultiFileSync(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Seed multiple files with varying modes.
+	seedFile(t, sideA, "readme.txt", "readme", t1())
+	if err := os.WriteFile(filepath.Join(sideA, "script.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(sideA, "script.sh"), t1(), t1()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	seedFile(t, sideA, "data/values.csv", "a,b,c", t1())
+
+	if err := doSync(t, "atomic", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	assertFile(t, sideB, "readme.txt", "readme")
+	assertFile(t, sideB, "data/values.csv", "a,b,c")
+
+	// Check script.sh content and mode.
+	got, err := os.ReadFile(filepath.Join(sideB, "script.sh"))
+	if err != nil {
+		t.Fatalf("read script.sh: %v", err)
+	}
+	if string(got) != "#!/bin/sh\n" {
+		t.Errorf("script.sh content: got %q", string(got))
+	}
+	info, err := os.Lstat(filepath.Join(sideB, "script.sh"))
+	if err != nil {
+		t.Fatalf("stat script.sh: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("script.sh mode: got %04o want 0755", info.Mode().Perm())
+	}
+
+	// No .caravan-tmp files must remain anywhere in sideB.
+	err = filepath.WalkDir(sideB, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if strings.HasSuffix(d.Name(), ".caravan-tmp") {
+			t.Errorf("leftover .caravan-tmp file: %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk sideB: %v", err)
+	}
+
+	// Second sync (nothing changed) must still be clean.
+	if err := doSync(t, "atomic", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+}
