@@ -1,0 +1,2 @@
+Let's setup git repo (repo already created at git@github.com:itsmaleen/caravan.git)
+commit and push to github
