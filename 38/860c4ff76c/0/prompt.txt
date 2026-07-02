@@ -1,0 +1,40 @@
+<task-notification>
+<task-id>aa0020db78be99daf</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-marlin-fable-experiments/f507fe17-d781-4a81-8f64-e112b7e8148f/tasks/aa0020db78be99daf.output</output-file>
+<status>completed</status>
+<summary>Agent "Mise toolchain validation in Docker" completed</summary>
+<result>Done. Here is the concise report:
+
+---
+
+**Files created:**
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/Dockerfile.mise` — multi-stage build (golang:1.24-bookworm builder → debian:bookworm-slim runtime), installs mise 2026.6.14 via `curl https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh`, sets `ENV MISE_YES=1` for non-interactive trust, creates `/srv/fixture` git repo (main branch, `mise.toml` pinning jq 1.7.1, README, git committed with throwaway identity), bakes manifest via inline `printf` in a RUN step.
+- `/Users/marlin/fable-experiments/drive-for-devs/caravan/sandbox/README.md` — appended "Toolchain (mise) validation" section.
+
+**Build command:**
+```
+docker build -f sandbox/Dockerfile.mise -t caravan-mise:local .
+```
+Build succeeded cleanly, mise 2026.6.14 linux-arm64 installed.
+
+**Cold-start timing:**
+- First `docker run --rm caravan-mise:local`: **~0.35 s** wall clock, caravan reports `took 13ms` (clone only, no mise).
+- Second run in same container (pull + mise install of jq): **~1.37 s** wall clock, caravan reports `took ~1s`.
+
+**Verification output** (`mise exec -C /root/code/fixture -- jq --version` after two caravan ups):
+```
+jq-1.7.1
+```
+
+---
+
+**Bug found — mise not called on initial clone:**
+
+File: `internal/provision/up.go`, lines 103–108 and 165–176.
+
+`processRepo` handles the "repo does not yet exist" case with an **early return** via `cloneRepo(r, dir)` at line 107. The mise integration block (lines 165–176) lives after the switch statement and is only reached on the `pullRepo` path (when the repo directory already exists). On a fresh machine the first `caravan up` only clones; mise is silently skipped. A second `caravan up` (pull = no-op, but reaches the mise block) is required before toolchains are provisioned.
+
+The mise integration itself is otherwise correct: `exec.Command("mise", "install")` with `cmd.Dir = dir` sets the working directory properly, `MISE_YES=1` prevents trust-prompt blocking, and jq 1.7.1 installs and runs successfully on the pull path.</result>
+<usage><subagent_tokens>44313</subagent_tokens><tool_uses>20</tool_uses><duration_ms>349268</duration_ms></usage>
+</task-notification>
