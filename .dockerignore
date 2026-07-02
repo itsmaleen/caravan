@@ -1,0 +1,10 @@
+# Exclude the compiled mac binary from the build context.
+# The Dockerfile builds caravan from source inside the builder stage.
+caravan
+
+# Test artifacts and OS cruft.
+*.test
+.DS_Store
+
+# Git history is not needed in the build context.
+.git

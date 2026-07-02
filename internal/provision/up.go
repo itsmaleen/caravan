@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
 	"caravan/internal/secrets"
 )
@@ -23,7 +24,7 @@ func CmdUp(args []string) int {
 	only := fs.String("only", "", "comma-separated repo names to provision")
 	f := fs.String("f", "", "manifest path")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	if _, err := cliargs.ParseAnywhere(fs, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
@@ -125,19 +126,21 @@ func processRepo(r manifest.Repo, dir, secretsPath string, useMise, dryRun bool)
 	}
 
 	action, detail, failed = pullRepo(dir)
-	if failed {
-		return action, branch, detail, failed
-	}
 
-	// Secrets: write .env if there are entries for this repo.
+	// Secrets: write .env even when pull failed — the repo dir exists and
+	// secrets/direnv should still be materialised so the developer can work.
 	envWritten := false
 	if secretsPath != "" {
 		env, err := secrets.DecryptRepoEnv(secretsPath, r.Name)
 		if err != nil {
-			detail = "[secrets: " + truncate(err.Error(), 80) + "]"
+			if !failed {
+				detail = "[secrets: " + truncate(err.Error(), 80) + "]"
+			}
 		} else if len(env) > 0 {
 			if wErr := writeEnv(dir, env); wErr != nil {
-				detail = "[env: " + wErr.Error() + "]"
+				if !failed {
+					detail = "[env: " + wErr.Error() + "]"
+				}
 			} else {
 				envWritten = true
 			}
@@ -150,6 +153,13 @@ func processRepo(r manifest.Repo, dir, secretsPath string, useMise, dryRun bool)
 		if _, err := os.Stat(envrcPath); os.IsNotExist(err) {
 			_ = os.WriteFile(envrcPath, []byte("dotenv\n"), 0o644)
 		}
+	}
+
+	if failed {
+		if envWritten {
+			detail += "; .env written"
+		}
+		return action, branch, detail, failed
 	}
 
 	// Toolchain: mise install if mise is configured, binary found, and config present.

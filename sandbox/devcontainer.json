@@ -1,0 +1,42 @@
+{
+  // Caravan agent-sandbox devcontainer.
+  // Builds the caravan binary from source, then runs `caravan up` after the
+  // container is created so the full workspace is present before the editor
+  // (or agent) opens the first file.
+  //
+  // Usage with VS Code / GitHub Codespaces:
+  //   1. Open the caravan repo in VS Code.
+  //   2. Run "Dev Containers: Reopen in Container" — the image builds and
+  //      caravan up runs automatically via postCreateCommand.
+  //   3. Open a terminal: ls /root/code to confirm repos are present.
+  //
+  // Age key injection (for manifests with secrets):
+  //   Option A — mount the key as a devcontainer secret or via mounts:
+  //     Add to devcontainer.json:
+  //       "mounts": ["source=${localEnv:HOME}/.config/caravan/age.key,
+  //                   target=/root/.config/caravan/age.key,type=bind,readonly"]
+  //   Option B — copy the key into the container after creation and run
+  //     `caravan up` manually.
+  //   The test manifest (sandbox/caravan.toml) needs no age key.
+
+  "name": "caravan-sandbox",
+
+  "build": {
+    "context": "..",
+    "dockerfile": "sandbox/Dockerfile"
+  },
+
+  // Override the ENTRYPOINT so the devcontainer starts normally; caravan up
+  // runs once via postCreateCommand instead of on every container restart.
+  "overrideCommand": true,
+
+  // Provision the workspace after the container is created.
+  "postCreateCommand": "caravan up",
+
+  // Default shell for the integrated terminal.
+  "settings": {
+    "terminal.integrated.defaultProfile.linux": "bash"
+  },
+
+  "remoteUser": "root"
+}

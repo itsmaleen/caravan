@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"caravan/internal/buildinfo"
 )
 
 // transportKind identifies the transfer mechanism.
@@ -110,6 +112,26 @@ func (r *RemoteConn) scanSSH(excludes []string, allowBootstrap bool) (map[string
 	if err := json.Unmarshal(out, &result); err != nil {
 		return nil, fmt.Errorf("parse remote scan: %w", err)
 	}
+
+	// Version handshake: if the remote binary is a different version, re-push
+	// it and rescan once (allowBootstrap guards against infinite recursion).
+	if result.Version != buildinfo.Version {
+		remoteVer := result.Version
+		if remoteVer == "" {
+			remoteVer = "pre-0.1.1"
+		}
+		fmt.Fprintf(os.Stderr, "remote caravan %s != local %s; updating…\n", remoteVer, buildinfo.Version)
+		if allowBootstrap {
+			if berr := r.bootstrap(); berr != nil {
+				fmt.Fprintf(os.Stderr, "caravan: version update failed: %v; proceeding\n", berr)
+			} else {
+				return r.scanSSH(excludes, false)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "caravan: remote version still mismatched after bootstrap; proceeding\n")
+		}
+	}
+
 	if result.Entries == nil {
 		result.Entries = map[string]Entry{}
 	}

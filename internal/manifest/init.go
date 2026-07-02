@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+
+	"caravan/internal/cliargs"
 )
 
 // CmdInit walks --root (default ~/code), detects git repos, and writes a manifest.
@@ -18,7 +20,7 @@ func CmdInit(args []string) int {
 	force := fs.Bool("force", false, "overwrite existing manifest")
 	f := fs.String("f", "", "manifest path (default: ~/.config/caravan/caravan.toml)")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	if _, err := cliargs.ParseAnywhere(fs, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}

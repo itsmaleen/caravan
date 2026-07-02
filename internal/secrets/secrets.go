@@ -22,6 +22,7 @@ import (
 
 	"filippo.io/age"
 
+	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
 )
 
@@ -237,7 +238,7 @@ func cmdSecretsInit(args []string) int {
 	fs := flag.NewFlagSet("secrets init", flag.ContinueOnError)
 	f := fs.String("f", "", "manifest path")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	if _, err := cliargs.ParseAnywhere(fs, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
@@ -296,14 +297,14 @@ func cmdSecretsSet(args []string) int {
 	fs := flag.NewFlagSet("secrets set", flag.ContinueOnError)
 	f := fs.String("f", "", "manifest path")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	pos, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
 
-	pos := fs.Args()
 	if len(pos) != 3 {
 		fmt.Fprintln(os.Stderr, "usage: caravan secrets set [-f MANIFEST] <repo> <KEY> <VALUE>")
 		return 2
@@ -348,14 +349,14 @@ func cmdSecretsShow(args []string) int {
 	f := fs.String("f", "", "manifest path")
 	reveal := fs.Bool("reveal", false, "show actual values instead of masking")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	pos, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
 
-	pos := fs.Args()
 	var filterRepo string
 	if len(pos) > 0 {
 		filterRepo = pos[0]
@@ -400,14 +401,14 @@ func cmdSecretsAddMachine(args []string) int {
 	fs := flag.NewFlagSet("secrets add-machine", flag.ContinueOnError)
 	f := fs.String("f", "", "manifest path")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	pos, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}
 		return 2
 	}
 
-	pos := fs.Args()
 	if len(pos) != 1 {
 		fmt.Fprintln(os.Stderr, "usage: caravan secrets add-machine [-f MANIFEST] <age-pubkey>")
 		return 2

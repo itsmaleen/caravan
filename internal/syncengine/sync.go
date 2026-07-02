@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
 )
 
@@ -32,7 +33,8 @@ func CmdSync(args []string) int {
 	intervalStr := fs.String("interval", "2s", "watch interval (e.g. 2s)")
 	_ = fs.Bool("bootstrap", false, "bootstrap remote binary (always attempted automatically)")
 
-	if err := fs.Parse(args); err != nil {
+	positionals, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil {
 		return 2
 	}
 
@@ -56,10 +58,10 @@ func CmdSync(args []string) int {
 
 	// Determine which sync entries to process.
 	var entries []manifest.Sync
-	if fs.NArg() == 0 {
+	if len(positionals) == 0 {
 		entries = m.Sync
 	} else {
-		name := fs.Arg(0)
+		name := positionals[0]
 		for _, s := range m.Sync {
 			if s.Name == name {
 				entries = append(entries, s)

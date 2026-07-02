@@ -13,6 +13,7 @@ import (
 
 	"caravan/internal/manifest"
 	"caravan/internal/provision"
+	"caravan/internal/secrets"
 )
 
 // captureStdout redirects os.Stdout during f and returns the captured output.
@@ -413,5 +414,141 @@ func TestReadLastSyncPresent(t *testing.T) {
 	}
 	if !strings.Contains(out, "mysync") {
 		t.Errorf("expected 'mysync' in output; got:\n%s", out)
+	}
+}
+
+// ── pull-fail soft behaviour (change 4) ──────────────────────────────────────
+
+// makeDivergedRepo creates a source repo and a clone that have diverged so
+// that git pull --ff-only will fail.
+func makeDivergedRepo(t *testing.T, sourceDir, cloneDir string) {
+	t.Helper()
+	initGitRepo(t, sourceDir)
+
+	if out, err := exec.Command("git", "clone", sourceDir, cloneDir).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+
+	runIn := func(dir string, args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	// Commit to source (origin advances).
+	srcFile := filepath.Join(sourceDir, "src.txt")
+	if err := os.WriteFile(srcFile, []byte("from-source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runIn(sourceDir, "config", "user.email", "t@t.com")
+	runIn(sourceDir, "config", "user.name", "T")
+	runIn(sourceDir, "add", "src.txt")
+	runIn(sourceDir, "commit", "-m", "source-commit")
+
+	// Commit to clone (local diverges from origin).
+	cloneFile := filepath.Join(cloneDir, "clone.txt")
+	if err := os.WriteFile(cloneFile, []byte("from-clone"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runIn(cloneDir, "config", "user.email", "t@t.com")
+	runIn(cloneDir, "config", "user.name", "T")
+	runIn(cloneDir, "add", "clone.txt")
+	runIn(cloneDir, "commit", "-m", "clone-commit")
+}
+
+// TestCmdUpPullFailReported verifies that when git pull --ff-only fails the
+// glyph is ✗ and the action is "error", and the overall exit code is 1.
+func TestCmdUpPullFailReported(t *testing.T) {
+	dir := t.TempDir()
+	wsRoot := filepath.Join(dir, "ws")
+	sourceDir := filepath.Join(dir, "source")
+	cloneDir := filepath.Join(wsRoot, "myrepo")
+	makeDivergedRepo(t, sourceDir, cloneDir)
+
+	manifestPath := makeTestManifest(t, dir, wsRoot, []manifest.Repo{
+		{Name: "myrepo", URL: sourceDir},
+	})
+
+	var code int
+	out := captureStdout(t, func() {
+		code = provision.CmdUp([]string{"-f", manifestPath})
+	})
+
+	if code == 0 {
+		t.Error("expected non-zero exit for diverged repo")
+	}
+	if !strings.Contains(out, "✗") {
+		t.Errorf("expected ✗ glyph for pull failure; got:\n%s", out)
+	}
+}
+
+// TestCmdUpPullFailEnvStillWritten verifies that secrets are materialised as
+// .env even when the git pull fails (change 4 behaviour).
+func TestCmdUpPullFailEnvStillWritten(t *testing.T) {
+	dir := t.TempDir()
+
+	// Point the secrets key at a temp location so we don't pollute ~/.config.
+	secrets.KeyPath = filepath.Join(dir, "age.key")
+	t.Cleanup(func() { secrets.KeyPath = "" })
+
+	wsRoot := filepath.Join(dir, "ws")
+	sourceDir := filepath.Join(dir, "source")
+	cloneDir := filepath.Join(wsRoot, "myrepo")
+	makeDivergedRepo(t, sourceDir, cloneDir)
+
+	// Build manifest with a secrets file.
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: wsRoot},
+		Repos:     []manifest.Repo{{Name: "myrepo", URL: sourceDir}},
+		Secrets:   manifest.Secrets{File: "secrets.enc.json"},
+	}
+	manifestPath := filepath.Join(dir, "caravan.toml")
+	if err := manifest.Save(manifestPath, m); err != nil {
+		t.Fatalf("Save manifest: %v", err)
+	}
+
+	// Initialise and populate the secrets store.
+	captureStdout(t, func() {
+		if code := secrets.CmdSecrets([]string{"init", "-f", manifestPath}); code != 0 {
+			t.Errorf("secrets init returned %d", code)
+		}
+	})
+	captureStdout(t, func() {
+		if code := secrets.CmdSecrets([]string{"set", "-f", manifestPath, "myrepo", "API_KEY", "topsecret"}); code != 0 {
+			t.Errorf("secrets set returned %d", code)
+		}
+	})
+
+	var code int
+	out := captureStdout(t, func() {
+		code = provision.CmdUp([]string{"-f", manifestPath})
+	})
+
+	// Pull still failed → exit 1.
+	if code == 0 {
+		t.Error("expected non-zero exit for diverged repo")
+	}
+
+	// Output should contain the failure glyph.
+	if !strings.Contains(out, "✗") {
+		t.Errorf("expected ✗ in output; got:\n%s", out)
+	}
+
+	// .env should have been written despite the pull failure.
+	envPath := filepath.Join(cloneDir, ".env")
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf(".env not written after pull failure: %v", err)
+	}
+	if !strings.Contains(string(data), "API_KEY=topsecret") {
+		t.Errorf(".env missing API_KEY; contents:\n%s", data)
+	}
+
+	// The detail column should mention .env written.
+	if !strings.Contains(out, ".env written") {
+		t.Errorf("expected '.env written' in output; got:\n%s", out)
 	}
 }

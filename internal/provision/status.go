@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
 )
 
@@ -30,7 +31,7 @@ func CmdStatus(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	f := fs.String("f", "", "manifest path")
 	fs.SetOutput(os.Stderr)
-	if err := fs.Parse(args); err != nil {
+	if _, err := cliargs.ParseAnywhere(fs, args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
 		}

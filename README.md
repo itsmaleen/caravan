@@ -56,9 +56,11 @@ modification beats deletion, and when both sides changed the newer mtime wins
 The remote side is scanned by running `caravan scan` over ssh. If the binary is
 missing on the remote and the platform matches, caravan copies itself to the
 remote's `~/.local/bin` automatically — a fresh machine needs nothing but ssh
-access.
+access. A version handshake on every scan re-pushes the binary whenever the
+remote is stale, so remotes never drift after the first bootstrap.
 
-Flags come before positional args (stdlib flag parsing): `caravan sync -f m.toml name`.
+Measured (MacBook ↔ Mac mini over Tailscale): 1003 files / ~15 MB initial push
+in ~9 s, no-op scan 0.4 s, single-file incremental ~1 s.
 
 ## Secrets
 
@@ -72,8 +74,9 @@ preserved).
 ## Testing
 
 ```
-go test ./...                                   # 71 unit/integration tests
-CARAVAN_BIN=$(pwd)/caravan ./test/e2e-sync.sh   # cross-device e2e (needs ssh to the mini)
+go test ./...                                    # unit/integration tests
+CARAVAN_BIN=$(pwd)/caravan ./test/e2e-sync.sh    # cross-device e2e (needs ssh to the mini)
+CARAVAN_BIN=$(pwd)/caravan ./test/stress-sync.sh # 1000-file cross-device stress/perf
 ```
 
 The e2e script exercises the real two-machine loop: initial push, edits in both
@@ -82,7 +85,9 @@ orientations, asserting sha256 tree parity after every round.
 
 ## Status / roadmap
 
-v0.1 (this) = Tier 0 provisioning + Tier 1 folder sync from PLAN.md, validated
-across a MacBook ↔ Mac mini pair. Not built (deliberately): FUSE/VFS anything,
+v0.1.1 = Tier 0 provisioning + Tier 1 folder sync from PLAN.md, validated
+across a MacBook ↔ Mac mini pair, plus the agent-sandbox recipe (`sandbox/` —
+a container cold-starts with the workspace provisioned in ~1.3 s). Flags may
+appear anywhere in the arg list. Not built (deliberately): FUSE/VFS anything,
 conflict UI, delta transfer, daemonization beyond `--watch`. See `../PLAN.md`
 for tiers and kill criteria.

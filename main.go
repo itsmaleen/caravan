@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"os"
 
+	"caravan/internal/buildinfo"
 	"caravan/internal/manifest"
 	"caravan/internal/provision"
 	"caravan/internal/secrets"
 	"caravan/internal/syncengine"
 )
-
-const version = "0.1.0"
 
 const usage = `caravan — one manifest, identical dev workspaces everywhere
 
@@ -48,7 +47,7 @@ func main() {
 	case "scan":
 		code = syncengine.CmdScan(args)
 	case "version", "--version", "-v":
-		fmt.Println("caravan " + version)
+		fmt.Println("caravan " + buildinfo.Version)
 	case "help", "--help", "-h":
 		fmt.Println(usage)
 	default:

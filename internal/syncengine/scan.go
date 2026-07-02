@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"caravan/internal/buildinfo"
+	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
 )
 
@@ -25,6 +27,7 @@ type Entry struct {
 // ScanResult is the JSON envelope emitted by CmdScan.
 type ScanResult struct {
 	Entries map[string]Entry `json:"entries"`
+	Version string           `json:"version,omitempty"` // caravan version that produced this scan
 }
 
 // ScanDir walks root and returns a map of slash-separated relative path → Entry.
@@ -116,7 +119,8 @@ func CmdScan(args []string) int {
 	jsonOut := fs.Bool("json", false, "output directory state as JSON (required)")
 	excludeStr := fs.String("exclude", "", "comma-separated exclude patterns")
 
-	if err := fs.Parse(args); err != nil {
+	positionals, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil {
 		return 2
 	}
 
@@ -125,7 +129,7 @@ func CmdScan(args []string) int {
 		return 2
 	}
 
-	if fs.NArg() != 1 {
+	if len(positionals) != 1 {
 		fmt.Fprintln(os.Stderr, "scan: expected exactly one DIR argument")
 		return 2
 	}
@@ -139,7 +143,7 @@ func CmdScan(args []string) int {
 		}
 	}
 
-	dir := manifest.ExpandPath(fs.Arg(0))
+	dir := manifest.ExpandPath(positionals[0])
 
 	result, symlinks, err := ScanDir(dir, excludes)
 	if err != nil {
@@ -152,7 +156,7 @@ func CmdScan(args []string) int {
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(ScanResult{Entries: result}); err != nil {
+	if err := enc.Encode(ScanResult{Entries: result, Version: buildinfo.Version}); err != nil {
 		fmt.Fprintf(os.Stderr, "scan: encode: %v\n", err)
 		return 1
 	}
