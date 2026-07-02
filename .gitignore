@@ -1,2 +1,3 @@
 caravan
 *.test
+dist/

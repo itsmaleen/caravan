@@ -45,11 +45,29 @@ type Toolchain struct {
 }
 
 type Sync struct {
-	Name     string   `toml:"name"`
-	Local    string   `toml:"local"`
-	Remote   string   `toml:"remote"`
-	Exclude  []string `toml:"exclude,omitempty"`
-	Checksum bool     `toml:"checksum,omitempty"`
+	Name          string   `toml:"name"`
+	Local         string   `toml:"local"`
+	Remote        string   `toml:"remote"`
+	Exclude       []string `toml:"exclude,omitempty"`
+	Checksum      bool     `toml:"checksum,omitempty"`
+	DeltaMinBytes int64    `toml:"delta_min_bytes,omitempty"`
+}
+
+// defaultDeltaThreshold is 8 MiB, used when DeltaMinBytes is 0.
+const defaultDeltaThreshold = 8 * 1024 * 1024
+
+// DeltaThreshold returns the minimum file size that qualifies for rsync delta
+// transfer. 0 → default 8 MiB; -1 → delta disabled (returns MaxInt64 so no
+// file ever qualifies); any other positive value is used as-is.
+func (s Sync) DeltaThreshold() int64 {
+	switch {
+	case s.DeltaMinBytes == -1:
+		return int64(^uint64(0) >> 1) // math.MaxInt64 without importing math
+	case s.DeltaMinBytes == 0:
+		return defaultDeltaThreshold
+	default:
+		return s.DeltaMinBytes
+	}
 }
 
 // DefaultExcludes are applied to every sync folder in addition to its own list.

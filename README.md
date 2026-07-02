@@ -15,6 +15,25 @@ caravan daemon ...    # install | uninstall | status — sync as a launchd servi
 caravan secrets ...   # init | set | show | add-machine
 ```
 
+## Install
+
+**Build from source (recommended for now):**
+```
+git clone <this-repo> && cd caravan
+make build          # outputs ./caravan
+```
+
+**Local install from a built release:**
+```
+make release                  # produces dist/ tarballs + checksums
+bash scripts/install.sh       # installs from dist/ → ~/.local/bin/caravan
+```
+`install.sh` also accepts `--url URL` or `$CARAVAN_BASE_URL` to fetch from a
+hosted release once one exists. See `scripts/install.sh` header for details.
+
+**Homebrew:** coming once the project has a public GitHub home.
+See `packaging/homebrew/caravan.rb` for the formula template and instructions.
+
 ## Manifest
 
 Resolution order: `-f` flag > `$CARAVAN_MANIFEST` > `~/.config/caravan/caravan.toml`.
@@ -45,6 +64,8 @@ remote   = "me@other-mac.tailnet.ts.net:~/notes"  # or "local:/Volumes/usb/notes
 exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store etc. always excluded
 checksum = false           # true: sha256 change detection (catches edits that
                            # preserve size+mtime, at the cost of hashing every scan)
+delta_min_bytes = 0        # files >= this use rsync delta transfer instead of tar
+                           # (0 = default 8 MiB, -1 = always whole-file)
 ```
 
 ## Continuous sync (daemon)
@@ -62,7 +83,12 @@ observed state of both sides is stored as the base under
 `~/.config/caravan/sync-state/`. Each run scans both sides, diffs against the
 base, and plans per path: new files copy across, deletions propagate,
 modification beats deletion, and when both sides changed the newer mtime wins
-(tie → local). `.git` and dependency dirs are hard-excluded.
+(tie → local). Conflict losers are never destroyed: the overwritten side's
+content is backed up to `~/.config/caravan/conflicts/<entry>/` on whichever
+machine lost (pruned after 7 days). Files above `delta_min_bytes` transfer via
+rsync so a small edit to a large file only moves changed blocks (40 MB file,
+1 KB append: ~1.8 s vs ~12 s full push). `.git` and dependency dirs are
+hard-excluded.
 
 The remote side is scanned by running `caravan scan` over ssh. If the binary is
 missing on the remote and the platform matches, caravan copies itself to the

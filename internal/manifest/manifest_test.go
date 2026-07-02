@@ -224,6 +224,80 @@ func TestRepoDirCustomPath(t *testing.T) {
 	}
 }
 
+// TestDeltaThreshold verifies the DeltaThreshold() helper encodes the three
+// value cases: 0 → default 8 MiB, -1 → disabled (MaxInt64), positive → as-is.
+func TestDeltaThreshold(t *testing.T) {
+	const eightMiB = int64(8 * 1024 * 1024)
+	const maxInt64 = int64(^uint64(0) >> 1)
+
+	tests := []struct {
+		name          string
+		deltaMinBytes int64
+		want          int64
+	}{
+		{"default (0)", 0, eightMiB},
+		{"disabled (-1)", -1, maxInt64},
+		{"custom positive", 1024 * 1024, 1024 * 1024},
+		{"custom large", 64 * 1024 * 1024, 64 * 1024 * 1024},
+	}
+	for _, tt := range tests {
+		s := manifest.Sync{DeltaMinBytes: tt.deltaMinBytes}
+		got := s.DeltaThreshold()
+		if got != tt.want {
+			t.Errorf("%s: DeltaThreshold() = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestDeltaMinBytesRoundTrip verifies that DeltaMinBytes survives Save→Load
+// and that omitempty keeps it out of the TOML when zero.
+func TestDeltaMinBytesRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "caravan.toml")
+
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: "~/code"},
+		Sync: []manifest.Sync{
+			{Name: "big", Local: "~/a", Remote: "h:~/a", DeltaMinBytes: 16 * 1024 * 1024},
+			{Name: "disabled", Local: "~/b", Remote: "h:~/b", DeltaMinBytes: -1},
+			{Name: "default", Local: "~/c", Remote: "h:~/c"},
+		},
+	}
+
+	if err := manifest.Save(path, m); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := manifest.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(got.Sync) != 3 {
+		t.Fatalf("Sync len: got %d want 3", len(got.Sync))
+	}
+	if got.Sync[0].DeltaMinBytes != 16*1024*1024 {
+		t.Errorf("Sync[0].DeltaMinBytes: got %d want %d", got.Sync[0].DeltaMinBytes, 16*1024*1024)
+	}
+	if got.Sync[1].DeltaMinBytes != -1 {
+		t.Errorf("Sync[1].DeltaMinBytes: got %d want -1", got.Sync[1].DeltaMinBytes)
+	}
+	if got.Sync[2].DeltaMinBytes != 0 {
+		t.Errorf("Sync[2].DeltaMinBytes: got %d want 0", got.Sync[2].DeltaMinBytes)
+	}
+
+	// omitempty: "default" entry must not contain delta_min_bytes in TOML.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	content := string(raw)
+	if !strings.Contains(content, "delta_min_bytes = 16777216") {
+		t.Errorf("expected 'delta_min_bytes = 16777216' in TOML:\n%s", content)
+	}
+}
+
 // TestSyncChecksumRoundTrip verifies that the Checksum field on [[sync]] entries
 // survives a Save→Load round-trip and that omitempty keeps it out of the TOML
 // when false.

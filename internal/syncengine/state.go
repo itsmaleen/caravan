@@ -13,6 +13,12 @@ import (
 // Tests set this to a t.TempDir() before calling Load/SaveState.
 var StateDir = ""
 
+// ConflictDir is the root directory for conflict-loser backups.
+// If empty it is derived as <resolvedStateDir()>/../conflicts, which in
+// production resolves to ~/.config/caravan/conflicts.
+// Tests set this to a t.TempDir() (or a subdir of StateDir) before syncing.
+var ConflictDir = ""
+
 func resolvedStateDir() string {
 	if StateDir != "" {
 		return StateDir
@@ -22,6 +28,13 @@ func resolvedStateDir() string {
 		return ".caravan-sync-state"
 	}
 	return filepath.Join(h, ".config", "caravan", "sync-state")
+}
+
+func resolvedConflictDir() string {
+	if ConflictDir != "" {
+		return ConflictDir
+	}
+	return filepath.Join(resolvedStateDir(), "..", "conflicts")
 }
 
 func statePath(name string) string {

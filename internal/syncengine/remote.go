@@ -490,6 +490,116 @@ func (r *RemoteConn) deleteSSH(paths []string, recursive bool) error {
 	return exec.Command("ssh", "-o", "BatchMode=yes", r.Host, cmd).Run()
 }
 
+// --- Rsync delta transfer ---
+
+// rsyncArgs constructs the rsync command-line arguments for a single-file
+// delta transfer between the local machine and a remote host over SSH.
+//
+// When push is true:  rsync … <localPath> <host>:'<remotePath>'
+// When push is false: rsync … <host>:'<remotePath>' <localPath>
+//
+// Flags used: -pt (preserve permissions and mtimes); these are supported by
+// openrsync (macOS) as well as GNU rsync.  -e overrides the remote shell to
+// ssh with BatchMode=yes so the transfer never prompts for a passphrase.
+// Remote paths that start with ~/ are converted to "$HOME/…" so the shell
+// expands them correctly inside the single-quoted argument wrapper we use;
+// for paths that start with ~/ we switch to double-quotes to allow $HOME.
+func rsyncArgs(push bool, host, localPath, remotePath string) []string {
+	remote := formatRsyncRemotePath(host, remotePath)
+	args := []string{"-pt", "-e", "ssh -o BatchMode=yes"}
+	if push {
+		args = append(args, localPath, remote)
+	} else {
+		args = append(args, remote, localPath)
+	}
+	return args
+}
+
+// formatRsyncRemotePath formats host:path for rsync, handling ~/ expansion.
+func formatRsyncRemotePath(host, remotePath string) string {
+	if remotePath == "~" {
+		return host + `:` + `"$HOME"`
+	}
+	if strings.HasPrefix(remotePath, "~/") {
+		// Use double-quotes so $HOME is expanded by the receiving shell.
+		return host + `:"$HOME/` + remotePath[2:] + `"`
+	}
+	return host + `:'` + remotePath + `'`
+}
+
+// PushDelta transfers files from localRoot to the remote root using rsync
+// delta transfer for each file individually. Only supported for SSH transport;
+// for local: transport it falls back to copyFile.
+//
+// On per-file rsync failure the error is returned so the caller can fall back
+// to the tar batch path.
+func (r *RemoteConn) PushDelta(localRoot string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	switch r.Kind {
+	case transportLocal:
+		// No benefit from rsync on local:; use direct copy.
+		return r.pushLocal(localRoot, paths)
+	case transportSSH:
+		for _, p := range paths {
+			localPath := filepath.Join(localRoot, filepath.FromSlash(p))
+			remotePath := absoluteRemotePath(r.Root, p)
+
+			// Ensure the parent directory exists on the remote.
+			parentRel := filepath.ToSlash(filepath.Dir(filepath.FromSlash(p)))
+			if parentRel == "." {
+				parentRel = ""
+			}
+			if err := r.mkdirSSH(parentRel); err != nil {
+				return fmt.Errorf("rsync push mkdir remote parent %s: %w", parentRel, err)
+			}
+
+			args := rsyncArgs(true, r.Host, localPath, remotePath)
+			cmd := exec.Command("rsync", args...)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("rsync push %s: %w", p, err)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// PullDelta fetches files from the remote root to localRoot using rsync delta
+// transfer for each file individually. Only supported for SSH transport;
+// for local: transport it falls back to copyFile.
+func (r *RemoteConn) PullDelta(localRoot string, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	switch r.Kind {
+	case transportLocal:
+		// No benefit from rsync on local:; use direct copy.
+		return r.pullLocal(localRoot, paths)
+	case transportSSH:
+		for _, p := range paths {
+			localPath := filepath.Join(localRoot, filepath.FromSlash(p))
+			remotePath := absoluteRemotePath(r.Root, p)
+
+			// Ensure the parent directory exists locally.
+			if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+				return fmt.Errorf("rsync pull mkdir local parent %s: %w", filepath.Dir(localPath), err)
+			}
+
+			args := rsyncArgs(false, r.Host, localPath, remotePath)
+			cmd := exec.Command("rsync", args...)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("rsync pull %s: %w", p, err)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
 // --- Helpers ---
 
 // copyFile copies src to dst, preserving mtime.

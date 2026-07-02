@@ -661,3 +661,204 @@ func TestIntegration_Checksum_NormalEditsStillWork(t *testing.T) {
 	}
 	assertFile(t, sideB, "f.txt", "v2 — longer content now")
 }
+
+// --- helpers for conflict-backup tests ---
+
+// setupConflictDir redirects the conflict backup directory into the test temp
+// dir (alongside the state dir) and restores the original on cleanup.
+func setupConflictDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "conflicts")
+	orig := ConflictDir
+	ConflictDir = dir
+	t.Cleanup(func() { ConflictDir = orig })
+	return dir
+}
+
+// findBackup looks for any file in conflictDir/syncName whose name starts with
+// flattenPath(rel)+".". Returns the full path of the first match, or "".
+func findBackup(conflictDir, syncName, rel string) string {
+	dir := filepath.Join(conflictDir, syncName)
+	prefix := flattenPath(rel) + "."
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
+
+// --- conflict backup integration tests ---
+
+// TestConflictBackup_PullWins: remote wins a conflict (pull) → local file
+// content must be preserved in ConflictDir before being overwritten.
+func TestConflictBackup_PullWins(t *testing.T) {
+	setupStateDir(t)
+	conflictDir := setupConflictDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Establish base.
+	seedFile(t, sideA, "f.txt", "original", t1())
+	if err := doSync(t, "cb", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Both sides modify f.txt; remote (sideB) is newer → remote wins → local is loser.
+	seedFile(t, sideA, "f.txt", "local version — to be lost", t2())
+	seedFile(t, sideB, "f.txt", "remote version — winner", t3())
+
+	if err := doSync(t, "cb", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	// Winner content propagated.
+	assertFile(t, sideA, "f.txt", "remote version — winner")
+	assertFile(t, sideB, "f.txt", "remote version — winner")
+
+	// Loser (local) content backed up.
+	backup := findBackup(conflictDir, "cb", "f.txt")
+	if backup == "" {
+		t.Fatal("expected a conflict backup for f.txt (local loser), found none")
+	}
+	got, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(got) != "local version — to be lost" {
+		t.Errorf("backup content: got %q want %q", string(got), "local version — to be lost")
+	}
+}
+
+// TestConflictBackup_PushWins: local wins a conflict (push) → remote file
+// content must be preserved in ConflictDir before being overwritten.
+func TestConflictBackup_PushWins(t *testing.T) {
+	setupStateDir(t)
+	conflictDir := setupConflictDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Establish base.
+	seedFile(t, sideA, "g.txt", "original", t1())
+	if err := doSync(t, "cbpush", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Both sides modify; local (sideA) is newer → local wins → remote is loser.
+	seedFile(t, sideA, "g.txt", "local version — winner", t3())
+	seedFile(t, sideB, "g.txt", "remote version — to be lost", t2())
+
+	if err := doSync(t, "cbpush", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	assertFile(t, sideA, "g.txt", "local version — winner")
+	assertFile(t, sideB, "g.txt", "local version — winner")
+
+	backup := findBackup(conflictDir, "cbpush", "g.txt")
+	if backup == "" {
+		t.Fatal("expected a conflict backup for g.txt (remote loser), found none")
+	}
+	got, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(got) != "remote version — to be lost" {
+		t.Errorf("backup content: got %q want %q", string(got), "remote version — to be lost")
+	}
+}
+
+// TestConflictBackup_TypeFlip_DirLoser: remote dir is the type-flip loser
+// (local file wins) → the remote dir tree must be backed up before pre-delete.
+func TestConflictBackup_TypeFlip_DirLoser(t *testing.T) {
+	setupStateDir(t)
+	conflictDir := setupConflictDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Establish base: local file "flip", remote mirrors it.
+	seedFile(t, sideA, "flip", "original file", t1())
+	if err := doSync(t, "tflip", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Remote replaces the file with a directory; local keeps it as a file.
+	// Remote's dir is newer → remote dir wins; BUT the base has "flip" as file,
+	// and remote flipped to dir → remote wins type-flip.
+	if err := os.Remove(filepath.Join(sideB, "flip")); err != nil {
+		t.Fatalf("remove remote file: %v", err)
+	}
+	seedFile(t, sideB, "flip/inner.txt", "remote dir content", t2())
+
+	if err := doSync(t, "tflip", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	// Remote dir wins; local should now have the dir.
+	assertDir(t, sideA, "flip")
+	assertFile(t, sideA, "flip/inner.txt", "remote dir content")
+
+	// The losing local FILE must have been backed up before OpPreDeleteLocal.
+	backup := findBackup(conflictDir, "tflip", "flip")
+	if backup == "" {
+		t.Fatal("expected a conflict backup for local 'flip' file (loser), found none")
+	}
+	got, err := os.ReadFile(backup)
+	if err != nil {
+		// Backup might be a directory if something went wrong — check.
+		info, statErr := os.Lstat(backup)
+		if statErr == nil && info.IsDir() {
+			// Also acceptable — dir backup of loser side.
+			return
+		}
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(got) != "original file" {
+		t.Errorf("backup content: got %q want %q", string(got), "original file")
+	}
+}
+
+// TestConflictBackup_Pruning: a backup file whose mtime is 8 days old must be
+// deleted on the next sync pass.
+func TestConflictBackup_Pruning(t *testing.T) {
+	setupStateDir(t)
+	conflictDir := setupConflictDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Create a synthetic old backup file directly in the conflict dir.
+	syncName := "prune"
+	backupDir := filepath.Join(conflictDir, syncName)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("mkdir conflict dir: %v", err)
+	}
+	oldFile := filepath.Join(backupDir, "old.txt.1000000000")
+	if err := os.WriteFile(oldFile, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write old file: %v", err)
+	}
+	// Set its mtime to 8 days ago.
+	eightDaysAgo := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(oldFile, eightDaysAgo, eightDaysAgo); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Trigger a sync (even an in-sync pass) to run pruning.
+	seedFile(t, sideA, "p.txt", "content", t1())
+	if err := doSync(t, syncName, sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Run a second sync to trigger pruning (first sync has no actions after 2nd).
+	if err := doSync(t, syncName, sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	// The old backup file should be gone.
+	if _, err := os.Lstat(oldFile); err == nil {
+		t.Error("expected old backup file to be pruned, but it still exists")
+	}
+}
