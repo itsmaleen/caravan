@@ -22,6 +22,7 @@ caravan doctor        # diagnose environment, repos, sync pairs, secrets
 ```
 git clone git@github.com:itsmaleen/caravan.git && cd caravan
 make build          # outputs ./caravan
+make install        # builds + installs to ~/.local/bin/caravan (override: PREFIX=/usr/local)
 ```
 
 **Local install from a built release:**
