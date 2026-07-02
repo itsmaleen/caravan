@@ -822,6 +822,148 @@ func TestConflictBackup_TypeFlip_DirLoser(t *testing.T) {
 	}
 }
 
+// --- chmod integration tests (local: transport) ---
+
+// assertFileMode checks that the file at root/rel has the expected permission bits.
+func assertFileMode(t *testing.T, root, rel string, want os.FileMode) {
+	t.Helper()
+	full := filepath.Join(root, filepath.FromSlash(rel))
+	info, err := os.Lstat(full)
+	if err != nil {
+		t.Errorf("assertFileMode %s: %v", rel, err)
+		return
+	}
+	got := info.Mode().Perm()
+	if got != want {
+		t.Errorf("assertFileMode %s: got %04o want %04o", rel, got, want)
+	}
+}
+
+// TestIntegration_Chmod_LocalChangePropagatesRemote: establish base with 0644,
+// chmod local to 0755, sync → remote must become 0755.
+func TestIntegration_Chmod_LocalChangePropagatesRemote(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed and sync.
+	seedFile(t, sideA, "script.sh", "#!/bin/sh\necho hi\n", t1())
+	if err := doSync(t, "chmod1", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertFileMode(t, sideB, "script.sh", 0o644)
+
+	// Step 2: chmod local file to 0755.
+	if err := os.Chmod(filepath.Join(sideA, "script.sh"), 0o755); err != nil {
+		t.Fatalf("chmod local: %v", err)
+	}
+
+	// Step 3: sync → remote should pick up 0755.
+	if err := doSync(t, "chmod1", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	assertFileMode(t, sideB, "script.sh", 0o755)
+}
+
+// TestIntegration_Chmod_RemoteChangePropagatesLocal: establish base with 0644,
+// chmod remote to 0700, sync → local must become 0700.
+func TestIntegration_Chmod_RemoteChangePropagatesLocal(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Step 1: seed and sync.
+	seedFile(t, sideA, "secret.sh", "#!/bin/sh\n", t1())
+	if err := doSync(t, "chmod2", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	assertFileMode(t, sideA, "secret.sh", 0o644)
+
+	// Step 2: chmod remote file to 0700.
+	if err := os.Chmod(filepath.Join(sideB, "secret.sh"), 0o700); err != nil {
+		t.Fatalf("chmod remote: %v", err)
+	}
+
+	// Step 3: sync → local should pick up 0700.
+	if err := doSync(t, "chmod2", sideA, "local:"+sideB, nil, false); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	assertFileMode(t, sideA, "secret.sh", 0o700)
+}
+
+// TestIntegration_Chmod_OldStateNoStorm: simulate an old state file that lacks
+// LMode/RMode (both 0) — no chmod storm should occur even when perms differ.
+func TestIntegration_Chmod_OldStateNoStorm(t *testing.T) {
+	setupStateDir(t)
+	sideA := t.TempDir()
+	sideB := t.TempDir()
+
+	// Manually create an "old" state with zero-mode base entries.
+	state := &State{
+		Pairs: map[string]BaseEntry{
+			"f.txt": {LSize: 5, LMtime: t1().UnixNano(), RSize: 5, RMtime: t1().UnixNano()},
+			// LMode=0, RMode=0 — simulates missing field from old state file
+		},
+		LastSync: t1().UnixNano(),
+	}
+	if err := SaveState("nochmod", state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	// Create files with differing perms (as-if they just happened to differ).
+	seedFile(t, sideA, "f.txt", "hello", t1())
+	seedFile(t, sideB, "f.txt", "hello", t1())
+	if err := os.Chmod(filepath.Join(sideB, "f.txt"), 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	// Sync should produce no actions (in sync, and base modes unknown → no chmod).
+	remote, _ := ParseRemote("local:" + sideB)
+	localEntries, _, _ := ScanDir(sideA, nil, false)
+	remoteEntries, _ := remote.Scan(nil, false)
+	actions := Plan(state.Pairs, localEntries, remoteEntries, false)
+	for _, a := range actions {
+		if a.Op == OpChmodLocal || a.Op == OpChmodRemote {
+			t.Errorf("unexpected chmod action with zero base modes: %v", a)
+		}
+	}
+}
+
+// TestCopyFile_OverwritePreservesMode: copyFile must propagate source mode even
+// when overwriting an existing file that has different permissions.
+func TestCopyFile_OverwritePreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.sh")
+	dst := filepath.Join(dir, "dst.sh")
+
+	// Write source with 0755.
+	if err := os.WriteFile(src, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	// Write destination with 0644 (different).
+	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write dst: %v", err)
+	}
+
+	// copyFile should overwrite and set mode to 0755.
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile: %v", err)
+	}
+
+	info, err := os.Lstat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("dst mode after copyFile: got %04o want 0755", info.Mode().Perm())
+	}
+	// Verify content too.
+	got, _ := os.ReadFile(dst)
+	if string(got) != "#!/bin/sh\n" {
+		t.Errorf("dst content: got %q want #!/bin/sh\\n", string(got))
+	}
+}
+
 // TestConflictBackup_Pruning: a backup file whose mtime is 8 days old must be
 // deleted on the next sync pass.
 func TestConflictBackup_Pruning(t *testing.T) {

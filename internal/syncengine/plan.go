@@ -17,6 +17,8 @@ const (
 	OpDeleteRemote    Op = "deleteRemote"
 	OpMkdirLocal      Op = "mkdirLocal"
 	OpMkdirRemote     Op = "mkdirRemote"
+	OpChmodLocal      Op = "chmodLocal"  // apply permission change to local path
+	OpChmodRemote     Op = "chmodRemote" // apply permission change to remote path
 )
 
 // Action is one unit of planned work.
@@ -24,7 +26,8 @@ type Action struct {
 	Op       Op
 	Path     string
 	Reason   string
-	Conflict bool // true if this action resolved a conflict
+	Conflict bool   // true if this action resolved a conflict
+	Mode     uint32 // target permission bits for OpChmodLocal / OpChmodRemote (e.g. 0o755)
 }
 
 // Plan is a pure function that computes the actions needed to synchronise local
@@ -224,14 +227,16 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 
 		case hasLocal && hasRemote && hasBase:
 			// Both present and in base.
+			contentAction := false
 			switch {
 			case !localModified && !remoteModified:
-				// In sync — nothing to do.
+				// In sync — nothing to do for content.
 
 			case localModified && !remoteModified:
 				// Only local changed.
 				if !l.IsDir {
 					actions = append(actions, Action{Op: OpPush, Path: p, Reason: "modified locally"})
+					contentAction = true
 				}
 				// If it's a dir and it "changed" (mtime bump), no content action needed.
 
@@ -239,6 +244,7 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 				// Only remote changed.
 				if !r.IsDir {
 					actions = append(actions, Action{Op: OpPull, Path: p, Reason: "modified remotely"})
+					contentAction = true
 				}
 
 			default:
@@ -250,6 +256,57 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 					actions = append(actions, Action{Op: OpPush, Path: p, Reason: "conflict: local newer or tie", Conflict: true})
 				} else {
 					actions = append(actions, Action{Op: OpPull, Path: p, Reason: "conflict: remote newer", Conflict: true})
+				}
+				contentAction = true
+			}
+
+			// Permission-change detection: only when content is NOT also being
+			// transferred (the push/pull already carries mode) and the base has
+			// known modes (LMode|RMode != 0 — zero means "written by older caravan").
+			if !contentAction && b.LMode|b.RMode != 0 {
+				lPerm := l.Mode & 0o777
+				rPerm := r.Mode & 0o777
+				lBasePerm := b.LMode & 0o777
+				rBasePerm := b.RMode & 0o777
+
+				lChanged := lPerm != lBasePerm
+				rChanged := rPerm != rBasePerm
+
+				switch {
+				case lChanged && !rChanged:
+					// Local perms changed, remote unchanged → push perm to remote.
+					actions = append(actions, Action{
+						Op:     OpChmodRemote,
+						Path:   p,
+						Reason: "local permission changed",
+						Mode:   lPerm,
+					})
+				case !lChanged && rChanged:
+					// Remote perms changed, local unchanged → apply to local.
+					actions = append(actions, Action{
+						Op:     OpChmodLocal,
+						Path:   p,
+						Reason: "remote permission changed",
+						Mode:   rPerm,
+					})
+				case lChanged && rChanged:
+					// Both changed — newer mtime wins; tie → local wins.
+					// Mode conflicts are not content loss; Conflict flag NOT set.
+					if l.Mtime >= r.Mtime {
+						actions = append(actions, Action{
+							Op:     OpChmodRemote,
+							Path:   p,
+							Reason: "permission conflict: local newer or tie",
+							Mode:   lPerm,
+						})
+					} else {
+						actions = append(actions, Action{
+							Op:     OpChmodLocal,
+							Path:   p,
+							Reason: "permission conflict: remote newer",
+							Mode:   rPerm,
+						})
+					}
 				}
 			}
 		}
@@ -359,6 +416,7 @@ func fileModified(e Entry, bSize, bMtime int64, bHash string, useHash bool) bool
 //  1. mkdirLocal / mkdirRemote — shallowest first
 //  2. push / pull
 //  3. deleteLocal / deleteRemote — deepest first (so child files go before parent dirs)
+//  4. chmodLocal / chmodRemote — path order within (run last, after content is settled)
 func sortActions(actions []Action) []Action {
 	priority := func(op Op) int {
 		switch op {
@@ -368,8 +426,10 @@ func sortActions(actions []Action) []Action {
 			return 1
 		case OpPush, OpPull:
 			return 2
-		default: // deleteLocal, deleteRemote
+		case OpDeleteLocal, OpDeleteRemote:
 			return 3
+		default: // chmodLocal, chmodRemote
+			return 4
 		}
 	}
 

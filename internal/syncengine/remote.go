@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -697,9 +698,67 @@ func (r *RemoteConn) PullDelta(localRoot string, paths []string) error {
 	return nil
 }
 
+// --- Chmod ---
+
+// ChmodPair describes one (path, permission-bits) entry for a Chmod batch.
+type ChmodPair struct {
+	Path string
+	Mode uint32 // permission bits only (e.g. 0o755)
+}
+
+// Chmod applies permission changes to a batch of paths under the remote root.
+// For SSH transport a single shell invocation is used (one chmod call per
+// unique mode value, or multiple args when modes match; for simplicity we
+// issue one chmod per pair joined into a single ssh session with &&).
+// For local: transport os.Chmod is called directly.
+func (r *RemoteConn) Chmod(pairs []ChmodPair) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	switch r.Kind {
+	case transportLocal:
+		for _, cp := range pairs {
+			target := filepath.Join(r.Root, filepath.FromSlash(cp.Path))
+			if err := os.Chmod(target, fs.FileMode(cp.Mode)); err != nil {
+				return fmt.Errorf("chmod %s: %w", cp.Path, err)
+			}
+		}
+		return nil
+	case transportSSH:
+		return r.chmodSSH(pairs)
+	}
+	return nil
+}
+
+func (r *RemoteConn) chmodSSH(pairs []ChmodPair) error {
+	// Build a single shell command: chmod <octal> <path> && chmod <octal> <path> …
+	// Reuse the same quoting helpers used by deleteSSH.
+	quoteAbs := func(abs string) string {
+		if strings.HasPrefix(abs, "~/") {
+			return `"$HOME/` + abs[2:] + `"`
+		} else if abs == "~" {
+			return `"$HOME"`
+		}
+		return `'` + abs + `'`
+	}
+
+	var parts []string
+	for _, cp := range pairs {
+		abs := absoluteRemotePath(r.Root, cp.Path)
+		parts = append(parts, fmt.Sprintf("chmod %04o %s", cp.Mode, quoteAbs(abs)))
+	}
+	cmd := strings.Join(parts, " && ")
+	return sshCommand(r.Host, cmd).Run()
+}
+
 // --- Helpers ---
 
-// copyFile copies src to dst, preserving mtime.
+// copyFile copies src to dst, preserving mode and mtime.
+//
+// On a fresh create, os.OpenFile with info.Mode() sets the correct
+// permissions.  On an overwrite (O_TRUNC of an existing file), the kernel
+// keeps the old file's permissions; we call os.Chmod explicitly afterwards
+// so the destination always reflects the source's permission bits.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -722,6 +781,12 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	if err := out.Close(); err != nil {
+		return err
+	}
+
+	// Explicitly set permissions so that overwriting an existing file with
+	// different mode bits propagates the source's mode (O_TRUNC does not chmod).
+	if err := os.Chmod(dst, info.Mode()); err != nil {
 		return err
 	}
 

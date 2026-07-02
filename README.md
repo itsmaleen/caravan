@@ -13,6 +13,7 @@ caravan sync          # bidirectional folder sync to another machine over ssh
 caravan sync --watch  # continuous sync: ~1s reaction to changes on either side
 caravan daemon ...    # install | uninstall | status — sync as a launchd service
 caravan secrets ...   # init | set | show | add-machine
+caravan doctor        # diagnose environment, repos, sync pairs, secrets
 ```
 
 ## Install
@@ -83,7 +84,8 @@ observed state of both sides is stored as the base under
 `~/.config/caravan/sync-state/`. Each run scans both sides, diffs against the
 base, and plans per path: new files copy across, deletions propagate,
 modification beats deletion, and when both sides changed the newer mtime wins
-(tie → local). Conflict losers are never destroyed: the overwritten side's
+(tie → local). Permission-only changes (chmod) propagate as their own cheap
+action. Conflict losers are never destroyed: the overwritten side's
 content is backed up to `~/.config/caravan/conflicts/<entry>/` on whichever
 machine lost (pruned after 7 days). Files above `delta_min_bytes` transfer via
 rsync so a small edit to a large file only moves changed blocks (40 MB file,

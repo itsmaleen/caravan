@@ -45,6 +45,12 @@ func statePath(name string) string {
 // for a single path.  Hash (sha256 hex) is populated when checksum mode is
 // enabled; after a successful sync both sides have identical content so a
 // single hash suffices.
+//
+// LMode and RMode record the permission bits (fs.FileMode & 0777) for each
+// side after the last sync.  A value of 0 means "unknown" (state files
+// written by older versions of caravan lack these fields); the planner treats
+// 0 as "don't flag mode changes" so existing deployments don't storm chmods
+// on first run after upgrade.
 type BaseEntry struct {
 	Hash   string `json:"hash,omitempty"`
 	LSize  int64  `json:"lsize"`
@@ -52,6 +58,8 @@ type BaseEntry struct {
 	RSize  int64  `json:"rsize"`
 	RMtime int64  `json:"rmtime"`
 	Dir    bool   `json:"dir"`
+	LMode  uint32 `json:"lmode,omitempty"`
+	RMode  uint32 `json:"rmode,omitempty"`
 }
 
 // State is the full persisted snapshot for one [[sync]] pair.
@@ -121,4 +129,18 @@ func GetStateInfo(name string) StateInfo {
 		return StateInfo{}
 	}
 	return StateInfo{LastSync: time.Unix(0, s.LastSync)}
+}
+
+// basePairsEqual reports whether two base maps are identical.
+func basePairsEqual(a, b map[string]BaseEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || va != vb {
+			return false
+		}
+	}
+	return true
 }

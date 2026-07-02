@@ -556,6 +556,215 @@ func TestPlanTypeConflict_ChildSuppression_LocalDirWinsOverRemoteFile(t *testing
 	}
 }
 
+// --- chmod planner unit tests ---
+
+// beMode builds a BaseEntry with known mode fields set.
+func beMode(ls, lm, rs, rm int64, dir bool, lmode, rmode uint32) BaseEntry {
+	return BaseEntry{LSize: ls, LMtime: lm, RSize: rs, RMtime: rm, Dir: dir, LMode: lmode, RMode: rmode}
+}
+
+// feMode creates an Entry with an explicit mode.
+func feMode(size, mtime int64, mode uint32) Entry {
+	return Entry{Size: size, Mtime: mtime, Mode: mode}
+}
+
+// TestPlanChmod_LocalOnlyChange: local perm changed vs base, remote unchanged
+// → expect OpChmodRemote with local's new perm.
+func TestPlanChmod_LocalOnlyChange(t *testing.T) {
+	base := map[string]BaseEntry{
+		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
+	}
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)} // perm changed
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)} // unchanged
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d: %v", len(actions), actions)
+	}
+	a := actions[0]
+	if a.Op != OpChmodRemote {
+		t.Errorf("op: got %s want OpChmodRemote", a.Op)
+	}
+	if a.Mode != 0o755 {
+		t.Errorf("mode: got %04o want 0755", a.Mode)
+	}
+	if a.Path != "f.txt" {
+		t.Errorf("path: got %q want f.txt", a.Path)
+	}
+}
+
+// TestPlanChmod_RemoteOnlyChange: remote perm changed vs base, local unchanged
+// → expect OpChmodLocal with remote's new perm.
+func TestPlanChmod_RemoteOnlyChange(t *testing.T) {
+	base := map[string]BaseEntry{
+		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
+	}
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)} // unchanged
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o600)} // perm changed
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d: %v", len(actions), actions)
+	}
+	a := actions[0]
+	if a.Op != OpChmodLocal {
+		t.Errorf("op: got %s want OpChmodLocal", a.Op)
+	}
+	if a.Mode != 0o600 {
+		t.Errorf("mode: got %04o want 0600", a.Mode)
+	}
+}
+
+// TestPlanChmod_BothChanged_LocalNewer: both perms changed vs base, local has
+// newer mtime → local wins → OpChmodRemote; Conflict NOT set.
+// Content (size+mtime) is unchanged on BOTH sides so no push/pull is planned
+// (chmod does not alter mtime on Linux/macOS, so base mtime still matches).
+func TestPlanChmod_BothChanged_LocalNewer(t *testing.T) {
+	// Base has lmtime=2000, rmtime=1000 so local looks "newer" for mtime tie-break.
+	// IMPORTANT: size and mtime must match base so fileModified returns false —
+	// only the mode field differs, so no content action is generated.
+	base := map[string]BaseEntry{
+		"f.txt": beMode(100, 2000, 100, 1000, false, 0o644, 0o644),
+	}
+	// Local: same size+mtime as base (content unchanged), but mode changed.
+	local := map[string]Entry{"f.txt": feMode(100, 2000, 0o755)}
+	// Remote: same size+mtime as base (content unchanged), but mode also changed.
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o600)}
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d: %v", len(actions), actions)
+	}
+	a := actions[0]
+	if a.Op != OpChmodRemote {
+		t.Errorf("op: got %s want OpChmodRemote", a.Op)
+	}
+	if a.Mode != 0o755 {
+		t.Errorf("mode: got %04o want 0755", a.Mode)
+	}
+	if a.Conflict {
+		t.Error("Conflict must NOT be set for mode-only conflicts")
+	}
+}
+
+// TestPlanChmod_BothChanged_Tie: both changed, same mtime on both sides → local wins.
+func TestPlanChmod_BothChanged_Tie(t *testing.T) {
+	// Same mtime on both sides (tie) — local wins.
+	// Size+mtime match base so fileModified returns false on both sides.
+	base := map[string]BaseEntry{
+		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
+	}
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)} // same size+mtime as base
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o600)} // same size+mtime as base
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d: %v", len(actions), actions)
+	}
+	a := actions[0]
+	if a.Op != OpChmodRemote {
+		t.Errorf("op: got %s want OpChmodRemote (tie → local wins)", a.Op)
+	}
+	if a.Mode != 0o755 {
+		t.Errorf("mode: got %04o want 0755", a.Mode)
+	}
+}
+
+// TestPlanChmod_BaseModesUnknown: base has LMode=RMode=0 → no chmod action
+// (old state file, don't storm chmods on first run after upgrade).
+func TestPlanChmod_BaseModesUnknown(t *testing.T) {
+	// be() produces a BaseEntry with LMode=RMode=0 (zero value).
+	base := map[string]BaseEntry{
+		"f.txt": be(100, 1000, 100, 1000, false),
+	}
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)}
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)}
+	actions := Plan(base, local, remote, false)
+	// No chmod actions expected when base modes are unknown.
+	for _, a := range actions {
+		if a.Op == OpChmodLocal || a.Op == OpChmodRemote {
+			t.Errorf("unexpected chmod action when base modes are 0: %v", a)
+		}
+	}
+}
+
+// TestPlanChmod_ContentChangeSuppressesChmod: when content also changed (push/pull
+// planned), no separate chmod action should be emitted (the transfer carries mode).
+func TestPlanChmod_ContentChangeSuppressesChmod(t *testing.T) {
+	base := map[string]BaseEntry{
+		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
+	}
+	// Local changed content AND perm.
+	local := map[string]Entry{"f.txt": feMode(200, 2000, 0o755)}
+	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)}
+	actions := Plan(base, local, remote, false)
+	// Should get OpPush but NOT a separate OpChmodRemote.
+	hasPush := false
+	for _, a := range actions {
+		if a.Op == OpPush {
+			hasPush = true
+		}
+		if a.Op == OpChmodLocal || a.Op == OpChmodRemote {
+			t.Errorf("unexpected chmod action when content also changed: %v", a)
+		}
+	}
+	if !hasPush {
+		t.Error("expected OpPush for content change, got none")
+	}
+}
+
+// TestPlanChmod_DirModeChange: dirs also support chmod — local dir perm changed
+// vs base → OpChmodRemote.
+func TestPlanChmod_DirModeChange(t *testing.T) {
+	base := map[string]BaseEntry{
+		"mydir": beMode(0, 1000, 0, 1000, true, 0o755, 0o755),
+	}
+	local := map[string]Entry{"mydir": Entry{Mtime: 1000, Mode: 0o700, IsDir: true}}
+	remote := map[string]Entry{"mydir": Entry{Mtime: 1000, Mode: 0o755, IsDir: true}}
+	actions := Plan(base, local, remote, false)
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 chmod action for dir, got %d: %v", len(actions), actions)
+	}
+	if actions[0].Op != OpChmodRemote {
+		t.Errorf("op: got %s want OpChmodRemote", actions[0].Op)
+	}
+	if actions[0].Mode != 0o700 {
+		t.Errorf("mode: got %04o want 0700", actions[0].Mode)
+	}
+}
+
+// TestPlanChmod_SortAfterDeletes: chmod actions must appear AFTER delete actions.
+func TestPlanChmod_SortAfterDeletes(t *testing.T) {
+	base := map[string]BaseEntry{
+		"keep.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
+		"del.txt":  beMode(50, 500, 50, 500, false, 0o644, 0o644),
+	}
+	local := map[string]Entry{
+		"keep.txt": feMode(100, 1000, 0o755), // perm changed → chmodRemote
+		// del.txt absent → deleteRemote
+	}
+	remote := map[string]Entry{
+		"keep.txt": feMode(100, 1000, 0o644),
+		"del.txt":  feMode(50, 500, 0o644),
+	}
+	actions := Plan(base, local, remote, false)
+	// Must have deleteRemote and chmodRemote; chmod must come after delete.
+	deleteIdx, chmodIdx := -1, -1
+	for i, a := range actions {
+		switch a.Op {
+		case OpDeleteRemote:
+			deleteIdx = i
+		case OpChmodRemote:
+			chmodIdx = i
+		}
+	}
+	if deleteIdx < 0 {
+		t.Fatal("expected OpDeleteRemote")
+	}
+	if chmodIdx < 0 {
+		t.Fatal("expected OpChmodRemote")
+	}
+	if chmodIdx < deleteIdx {
+		t.Errorf("chmod (idx %d) must come AFTER delete (idx %d)", chmodIdx, deleteIdx)
+	}
+}
+
 // --- hash-mode planner unit tests ---
 
 // feH creates an Entry with size, mtime and a hash (for hash-mode testing).

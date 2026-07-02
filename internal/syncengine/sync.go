@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,6 +27,7 @@ type SyncStats struct {
 	Conflicts       int
 	Errors          int
 	ConflictBackups int // number of successful conflict-loser backups
+	Chmods          int // permission-only changes applied
 }
 
 // CmdSync implements `caravan sync [NAME] [--watch] [--interval 1s] [--dry-run] [--bootstrap] [-f manifest]`.
@@ -305,6 +307,19 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	actions := Plan(state.Pairs, localEntries, remoteEntries, s.Checksum)
 
 	if len(actions) == 0 {
+		// Even with nothing to transfer, refresh the base when the current
+		// scans carry information the stored base lacks (modes and hashes
+		// added by newer versions) — otherwise features gated on base
+		// metadata (chmod detection, checksum mode) stay dormant forever on
+		// pairs that are already in sync.
+		if !dryRun {
+			refreshed := buildBase(localEntries, remoteEntries)
+			if !basePairsEqual(state.Pairs, refreshed) {
+				if err := SaveState(s.Name, &State{Pairs: refreshed, LastSync: time.Now().UnixNano()}); err != nil {
+					fmt.Fprintf(os.Stderr, "sync: save state: %v\n", err)
+				}
+			}
+		}
 		if !quiet {
 			total := countFiles(localEntries)
 			fmt.Printf("✓ %s in sync (%d files)\n", s.Name, total)
@@ -338,6 +353,9 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	// Summary line.
 	fmt.Printf("  pushed %d, pulled %d, deleted %d local/%d remote, conflicts %d",
 		stats.Pushed, stats.Pulled, stats.DeletedL, stats.DeletedR, stats.Conflicts)
+	if stats.Chmods > 0 {
+		fmt.Printf(", chmods %d", stats.Chmods)
+	}
 	if stats.Errors > 0 {
 		fmt.Printf(", errors %d", stats.Errors)
 	}
@@ -387,6 +405,7 @@ func applyActions(
 
 	var pushPaths, pullPaths []string
 	var delLocalFiles, delRemoteFiles, delLocalDirs, delRemoteDirs []string
+	var chmodLocalActions, chmodRemoteActions []Action
 
 	for _, a := range actions {
 		if a.Conflict {
@@ -416,6 +435,10 @@ func applyActions(
 		}
 
 		switch a.Op {
+		case OpChmodLocal:
+			chmodLocalActions = append(chmodLocalActions, a)
+		case OpChmodRemote:
+			chmodRemoteActions = append(chmodRemoteActions, a)
 		case OpPreDeleteLocal:
 			// Back up the local loser before removing it (if it's a conflict).
 			if a.Conflict {
@@ -570,6 +593,31 @@ func applyActions(
 			stats.Errors++
 		} else {
 			stats.DeletedR++
+		}
+	}
+
+	// Apply local permission changes (run last, after content is settled).
+	for _, a := range chmodLocalActions {
+		target := localJoin(localRoot, a.Path)
+		if err := os.Chmod(target, fs.FileMode(a.Mode)); err != nil {
+			fmt.Fprintf(os.Stderr, "chmod local %s: %v\n", a.Path, err)
+			stats.Errors++
+		} else {
+			stats.Chmods++
+		}
+	}
+
+	// Apply remote permission changes as a single batched SSH invocation.
+	if len(chmodRemoteActions) > 0 {
+		pairs := make([]ChmodPair, len(chmodRemoteActions))
+		for i, a := range chmodRemoteActions {
+			pairs[i] = ChmodPair{Path: a.Path, Mode: a.Mode}
+		}
+		if err := remote.Chmod(pairs); err != nil {
+			fmt.Fprintf(os.Stderr, "chmod remote: %v\n", err)
+			stats.Errors++
+		} else {
+			stats.Chmods += len(chmodRemoteActions)
 		}
 	}
 
@@ -742,6 +790,8 @@ func buildBase(local, remote map[string]Entry) map[string]BaseEntry {
 				RSize:  r.Size,
 				RMtime: r.Mtime,
 				Dir:    l.IsDir || r.IsDir,
+				LMode:  l.Mode & 0o777,
+				RMode:  r.Mode & 0o777,
 			}
 		}
 	}
@@ -773,6 +823,8 @@ func printPlan(name string, actions []Action) {
 			marker = "+"
 		case OpPreDeleteLocal, OpPreDeleteRemote:
 			marker = "⚡"
+		case OpChmodLocal, OpChmodRemote:
+			marker = "±"
 		}
 		fmt.Printf("  %s  %-*s  %s  %s\n", marker, maxPath, a.Path, opSide(a.Op), a.Reason)
 	}
@@ -780,9 +832,9 @@ func printPlan(name string, actions []Action) {
 
 func opSide(op Op) string {
 	switch op {
-	case OpPush, OpMkdirRemote, OpDeleteRemote, OpPreDeleteRemote:
+	case OpPush, OpMkdirRemote, OpDeleteRemote, OpPreDeleteRemote, OpChmodRemote:
 		return "→remote"
-	case OpPull, OpMkdirLocal, OpDeleteLocal, OpPreDeleteLocal:
+	case OpPull, OpMkdirLocal, OpDeleteLocal, OpPreDeleteLocal, OpChmodLocal:
 		return "←local "
 	}
 	return "       "

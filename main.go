@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"caravan/internal/buildinfo"
+	"caravan/internal/doctor"
 	"caravan/internal/manifest"
 	"caravan/internal/provision"
 	"caravan/internal/secrets"
@@ -19,6 +20,7 @@ Usage:
   caravan up [--dry-run] [--only a,b] [-f MANIFEST]     provision workspace (clone/pull, secrets, toolchain)
   caravan status [-f MANIFEST]                          repo + sync-folder status
   caravan secrets <init|set|show|add-machine> [...]     manage encrypted secrets sidecar
+  caravan doctor [-f MANIFEST]                          diagnose environment, repos, sync, secrets
   caravan sync [NAME] [--watch] [--interval 2s] [--dry-run] [--bootstrap] [-f MANIFEST]
                                                         bidirectional folder sync (ssh or local:)
   caravan daemon <install|uninstall|status> [NAME] [--interval 5s] [-f MANIFEST]
@@ -48,6 +50,8 @@ func main() {
 		code = syncengine.CmdSync(args)
 	case "daemon":
 		code = syncengine.CmdDaemon(args)
+	case "doctor":
+		code = doctor.CmdDoctor(args)
 	case "scan":
 		code = syncengine.CmdScan(args)
 	case "version", "--version", "-v":
