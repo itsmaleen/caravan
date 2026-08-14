@@ -3,6 +3,7 @@ package syncengine
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,12 +65,25 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 // multiplexing means the first call opens a master connection that subsequent
 // calls (scans, transfers, deletes) reuse, eliminating per-op handshake cost;
 // the master lingers 60s past the last use.
+//
+// Keepalive is essential, not optional. Without ServerAliveInterval a half-open
+// TCP connection — the normal aftermath of a laptop sleeping or tailscale
+// re-keying — leaves an ssh read() blocking FOREVER. Because every op (the
+// long-poll scan, rsync pushes, deletes) multiplexes over one shared master,
+// a single half-open master silently freezes the whole watch loop until the
+// process is killed (observed 2026-08-13: a 7-hour stall after the Mac slept).
+// With these set, ssh detects a dead peer in ~45s (15s × 3) and exits with an
+// error the daemon's backoff/retry already handles; the master self-recycles
+// because the option applies to the master connection too.
 func sshBaseArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
 		"-o", "ControlPersist=60s",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "ConnectTimeout=10",
 	}
 }
 
@@ -77,6 +91,13 @@ func sshBaseArgs() []string {
 func sshCommand(host, remoteCmd string) *exec.Cmd {
 	args := append(sshBaseArgs(), host, remoteCmd)
 	return exec.Command("ssh", args...)
+}
+
+// sshCommandContext is sshCommand bound to a context, so a caller can hard-cap a
+// blocking ssh (the long-poll scan) as a backstop even if keepalive misses.
+func sshCommandContext(ctx context.Context, host, remoteCmd string) *exec.Cmd {
+	args := append(sshBaseArgs(), host, remoteCmd)
+	return exec.CommandContext(ctx, "ssh", args...)
 }
 
 // sshCarrier is the -e argument handed to rsync.
@@ -207,7 +228,14 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	windowStr := window.Round(time.Millisecond).String()
 	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr)
 
-	cmd := sshCommand(r.Host, cmdStr)
+	// Hard-cap the long-poll so a hung ssh read can never freeze the watch loop
+	// indefinitely. Keepalive (sshBaseArgs) should catch a dead peer first in
+	// ~45s; this is the backstop. The remote returns at ~window, so window plus a
+	// generous margin is a safe ceiling — anything past it is stuck, and on
+	// timeout exec kills the ssh and Run() returns an error the daemon retries.
+	ctx, cancel := context.WithTimeout(context.Background(), window+60*time.Second)
+	defer cancel()
+	cmd := sshCommandContext(ctx, r.Host, cmdStr)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
