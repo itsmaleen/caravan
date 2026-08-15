@@ -100,6 +100,23 @@ func sshCommandContext(ctx context.Context, host, remoteCmd string) *exec.Cmd {
 	return exec.CommandContext(ctx, "ssh", args...)
 }
 
+// closeMaster tears down the shared ControlMaster for this host via `ssh -O
+// exit`, so the next ssh establishes a fresh connection. Keepalive only recycles
+// a master that a keepalive-aware process created; a stale master left by a
+// pre-keepalive process (or wedged before its probes fired) persists at the
+// fixed ControlPath and would be *reused* by a retry or a restart, re-hanging
+// immediately. Reaping it at startup and after a long-poll timeout closes that
+// gap. Best-effort: "no master running" is the normal, ignored outcome.
+func (r *RemoteConn) closeMaster() {
+	if r.Kind != transportSSH || r.Host == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	args := append(sshBaseArgs(), "-O", "exit", r.Host)
+	_ = exec.CommandContext(ctx, "ssh", args...).Run()
+}
+
 // sshCarrier is the -e argument handed to rsync.
 func sshCarrier() string {
 	return "ssh " + strings.Join(sshBaseArgs(), " ")
@@ -241,6 +258,12 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Run(); err != nil {
+		// A timeout means the long-poll wedged (a half-open master is the usual
+		// cause). Tear the master down so the next attempt reconnects fresh
+		// instead of reusing the same stuck socket.
+		if ctx.Err() != nil {
+			r.closeMaster()
+		}
 		return nil, true, fmt.Errorf("remote wait-scan on %s: %w (stderr: %s)", r.Host, err, stderrBuf.String())
 	}
 

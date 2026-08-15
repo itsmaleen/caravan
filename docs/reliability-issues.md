@@ -94,10 +94,13 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
   (this change does it for the long-poll; extend to push/scan) and *exited* on
   repeated consecutive failures, `KeepAlive` would restart it — but the restart
   must **recycle the master first** (see below), or it re-hangs.
-- **[IDEA] `kickstart`/startup should reap a stale master.** On daemon start,
-  `ssh -O exit` (or remove the `ControlPath` socket) for its hosts before the
-  first op, so a restart never inherits a dead master. Would make the manual
-  recovery (and the external watchdog) unnecessary.
+- **[FIXED, 0.6.1] Reap a stale master at startup and after a timeout.**
+  `RemoteConn.closeMaster()` (`ssh -O exit`) now runs at the start of each watch
+  entry and whenever the long-poll times out, so a restart or retry can't inherit
+  a half-open master at the shared `ControlPath` and re-hang. This is what
+  `exec.CommandContext` alone could not do — it kills the passenger ssh, not the
+  persistent master. (Follow-up still worth it: a per-sync `ControlPath` so one
+  host's reap doesn't tear down an unrelated sync sharing the same master.)
 - **[IDEA] Conflict backups accumulate silently.** `~/.config/caravan/conflicts/`
   had 11 stale backups (a rapidly-rewritten `signal/.state/domains.json` churned
   many; plus one from a hand-rsync racing the daemon). Consider pruning old
@@ -122,8 +125,11 @@ make install
 pkill -f 'ssh: /tmp/caravan-ssh-.*<host>'; rm -f /tmp/caravan-ssh-*<host>*
 launchctl kickstart -k gui/$(id -u)/dev.caravan.sync.<name>
 
-# the running binary really passes keepalive:
-ps aux | grep '[c]aravan scan' | grep -o 'ServerAliveInterval=[0-9]*'
+# the running binary really passes ALL the keepalive options (fails if any is missing):
+cmdline="$(ps aux | grep '[c]aravan scan' || true)"
+for opt in ServerAliveInterval=15 ServerAliveCountMax=3 ConnectTimeout=10; do
+  grep -q -- "$opt" <<<"$cmdline" || { echo "missing $opt" >&2; exit 1; }
+done && echo "keepalive options present"
 
 # end-to-end: a change auto-propagates
 echo t-$(date +%s) > ~/<synced>/.synctest; sleep 30
