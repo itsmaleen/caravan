@@ -80,10 +80,12 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
 
 ## Standing issues & improvement ideas (found along the way)
 
-- **[IDEA] Single ControlMaster mux is a single point of failure.** One dead
-  master hangs every op. Keepalive now recycles it, but consider a per-sync
-  master (distinct `ControlPath` per entry) or a periodic master health-ping so
-  one wedged connection can't stall unrelated syncs.
+- **[PARTLY FIXED, 0.6.1] Single ControlMaster mux as a SPOF.** One dead master
+  hangs every op sharing it. Keepalive now recycles it and the `ControlPath` is
+  now per-process (above), so unrelated caravan *processes* no longer share a
+  master. Still open: within one process, multiple sync entries to the same host
+  still share a master; a periodic master health-ping would catch a wedge faster
+  than the long-poll timeout.
 - **[IDEA] The daemon emits no idle heartbeat.** When there are no changes it
   logs nothing, so log-staleness is useless for external liveness monitoring
   (the client watchdog had to detect a stuck *ssh* instead). A cheap periodic
@@ -97,10 +99,15 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
 - **[FIXED, 0.6.1] Reap a stale master at startup and after a timeout.**
   `RemoteConn.closeMaster()` (`ssh -O exit`) now runs at the start of each watch
   entry and whenever the long-poll times out, so a restart or retry can't inherit
-  a half-open master at the shared `ControlPath` and re-hang. This is what
-  `exec.CommandContext` alone could not do — it kills the passenger ssh, not the
-  persistent master. (Follow-up still worth it: a per-sync `ControlPath` so one
-  host's reap doesn't tear down an unrelated sync sharing the same master.)
+  a half-open master and re-hang. This is what `exec.CommandContext` alone could
+  not do — it kills the passenger ssh, not the persistent master.
+- **[FIXED, 0.6.1] Per-process `ControlPath`.** The socket path now embeds the
+  pid (`/tmp/caravan-ssh-<pid>-%r@%h-%p`) rather than being shared by every
+  caravan process syncing to the same host, so one process's `closeMaster` or
+  restart can no longer tear down a master another process is actively using, and
+  a restarted daemon gets a fresh path it cannot inherit a stale master from.
+  (Trade-off: separate caravan processes to the same host no longer share one
+  master — a negligible per-process handshake cost for the isolation.)
 - **[IDEA] Conflict backups accumulate silently.** `~/.config/caravan/conflicts/`
   had 11 stale backups (a rapidly-rewritten `signal/.state/domains.json` churned
   many; plus one from a hand-rsync racing the daemon). Consider pruning old

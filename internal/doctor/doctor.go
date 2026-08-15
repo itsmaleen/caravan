@@ -322,7 +322,7 @@ func sshDoctorArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
 		"-o", "ControlPersist=60s",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",

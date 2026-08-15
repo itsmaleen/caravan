@@ -66,20 +66,26 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 // calls (scans, transfers, deletes) reuse, eliminating per-op handshake cost;
 // the master lingers 60s past the last use.
 //
+// The ControlPath is scoped to THIS process (its pid), not just the SSH target.
+// A bare `%r@%h-%p` path is shared by every caravan process syncing to the same
+// host, so one process's closeMaster (`ssh -O exit`) or restart would tear down
+// a master another process is actively using. Per-pid isolation also means a
+// restarted daemon gets a fresh path and cannot inherit a stale master left by
+// its predecessor.
+//
 // Keepalive is essential, not optional. Without ServerAliveInterval a half-open
 // TCP connection — the normal aftermath of a laptop sleeping or tailscale
-// re-keying — leaves an ssh read() blocking FOREVER. Because every op (the
-// long-poll scan, rsync pushes, deletes) multiplexes over one shared master,
-// a single half-open master silently freezes the whole watch loop until the
-// process is killed (observed 2026-08-13: a 7-hour stall after the Mac slept).
-// With these set, ssh detects a dead peer in ~45s (15s × 3) and exits with an
-// error the daemon's backoff/retry already handles; the master self-recycles
-// because the option applies to the master connection too.
+// re-keying — leaves an ssh read() blocking FOREVER, and a single half-open
+// master silently freezes the whole watch loop until the process is killed
+// (observed 2026-08-13: a 7-hour stall after the Mac slept). With these set, ssh
+// detects a dead peer in ~45s (15s × 3) and exits with an error the daemon's
+// backoff/retry already handles; the master self-recycles because the option
+// applies to the master connection too.
 func sshBaseArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
 		"-o", "ControlPersist=60s",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
