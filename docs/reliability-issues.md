@@ -127,10 +127,18 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
 ## Verifying a fix (quick recipe)
 
 ```bash
-# build/install locally, restart the daemon on the new binary (recycle the mux!)
+# Set these first — every value is a placeholder, replace before running:
+HOST='m@mini.example.ts.net'   # ssh target of the sync
+NAME='wrinkles'                # launchd agent suffix: dev.caravan.sync.$NAME
+LOCAL="$HOME/wrinkles"         # local synced dir
+REMOTE='~/wrinkles'            # same dir on the remote (tilde expands there)
+
+# build/install locally, restart the daemon on the new binary (recycle the mux!).
+# NOTE: this pkill/rm is host-wide — it resets EVERY caravan master to $HOST, not
+# just $NAME's; each reconnects on its next cycle, which is fine for recovery.
 make install
-pkill -f 'ssh: /tmp/caravan-ssh-.*<host>'; rm -f /tmp/caravan-ssh-*<host>*
-launchctl kickstart -k gui/$(id -u)/dev.caravan.sync.<name>
+pkill -f "ssh: /tmp/caravan-ssh-.*${HOST##*@}"; rm -f /tmp/caravan-ssh-*"${HOST##*@}"*
+launchctl kickstart -k "gui/$(id -u)/dev.caravan.sync.$NAME"
 
 # the running binary really passes ALL the keepalive options (fails if any is missing):
 cmdline="$(ps aux | grep '[c]aravan scan' || true)"
@@ -139,6 +147,6 @@ for opt in ServerAliveInterval=15 ServerAliveCountMax=3 ConnectTimeout=10; do
 done && echo "keepalive options present"
 
 # end-to-end: a change auto-propagates
-echo t-$(date +%s) > ~/<synced>/.synctest; sleep 30
-ssh <host> cat '~/<synced>/.synctest'; rm ~/<synced>/.synctest
+echo "t-$(date +%s)" > "$LOCAL/.synctest"; sleep 30
+ssh "$HOST" "cat $REMOTE/.synctest"; rm "$LOCAL/.synctest"
 ```

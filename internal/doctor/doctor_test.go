@@ -611,3 +611,20 @@ func localCaravanVersion() string {
 	}
 	return ""
 }
+
+// TestSSHDoctorArgsKeepalive keeps the diagnostic ssh options in lockstep with
+// syncengine's sshBaseArgs (keepalive + pid-scoped ControlPath), guarding the
+// intentional shorter ConnectTimeout used only for doctor probes.
+func TestSSHDoctorArgsKeepalive(t *testing.T) {
+	args := strings.Join(sshDoctorArgs(), " ")
+	for _, want := range []string{
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
+		"ConnectTimeout=5",
+		fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("sshDoctorArgs() missing %q\n  got: %s", want, args)
+		}
+	}
+}
