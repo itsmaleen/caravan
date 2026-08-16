@@ -252,11 +252,16 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr)
 
 	// Hard-cap the long-poll so a hung ssh read can never freeze the watch loop
-	// indefinitely. Keepalive (sshBaseArgs) should catch a dead peer first in
-	// ~45s; this is the backstop. The remote returns at ~window, so window plus a
-	// generous margin is a safe ceiling — anything past it is stuck, and on
-	// timeout exec kills the ssh and Run() returns an error the daemon retries.
-	ctx, cancel := context.WithTimeout(context.Background(), window+60*time.Second)
+	// indefinitely. Keepalive (sshBaseArgs) is the PRIMARY defense: it kills a
+	// dead peer in ~45s, and the ssh server keeps answering keepalive probes even
+	// while a slow remote scan computes, so keepalive never false-fires on a
+	// healthy-but-slow scan. This context is only the backstop for a non-network
+	// hang, so it must stay generous enough never to trip on a legitimately slow
+	// long-poll: a large or checksummed remote tree can take several full scans
+	// and run well past window+60s (window itself is only ~20s). A few minutes of
+	// headroom keeps a real non-network hang bounded while leaving healthy slow
+	// scans alone.
+	ctx, cancel := context.WithTimeout(context.Background(), window+3*time.Minute)
 	defer cancel()
 	cmd := sshCommandContext(ctx, r.Host, cmdStr)
 	var stdoutBuf, stderrBuf bytes.Buffer
