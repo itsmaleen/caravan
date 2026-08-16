@@ -315,14 +315,17 @@ func checkLocalRemote(label, root string) []result {
 }
 
 // sshDoctorArgs mirrors the options from syncengine/remote.go sshBaseArgs()
-// with an extra ConnectTimeout for diagnostic use. sshBaseArgs is unexported
-// in syncengine, so we duplicate the small list here.
+// with a shorter ConnectTimeout for diagnostic use. sshBaseArgs is unexported
+// in syncengine, so we duplicate the small list here — keep the keepalive
+// options in sync with it.
 func sshDoctorArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
 		"-o", "ControlPersist=60s",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=5",
 	}
 }

@@ -1,6 +1,7 @@
 package syncengine
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,5 +229,23 @@ func TestCopyFile_Atomic_ModePreserved(t *testing.T) {
 	// No leftover tmp.
 	if _, err := os.Lstat(dst + ".caravan-tmp"); err == nil {
 		t.Error(".caravan-tmp file unexpectedly exists after successful copy")
+	}
+}
+
+// TestSSHBaseArgsKeepalive pins the ssh reliability options so they cannot
+// silently regress: dropping ServerAliveInterval reintroduces the sleep-induced
+// watch-loop hang, and dropping the pid from ControlPath un-isolates concurrent
+// caravan processes sharing a host.
+func TestSSHBaseArgsKeepalive(t *testing.T) {
+	args := strings.Join(sshBaseArgs(), " ")
+	for _, want := range []string{
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
+		"ConnectTimeout=10",
+		fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("sshBaseArgs() missing %q\n  got: %s", want, args)
+		}
 	}
 }

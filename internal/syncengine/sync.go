@@ -140,6 +140,13 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 	const backoffBase = 5 * time.Second
 	const backoffMax = 60 * time.Second
 
+	// Clear any stale ControlMaster left by a previous (possibly pre-keepalive)
+	// process before the first op, so a restart can't inherit a half-open master
+	// at the shared ControlPath and immediately re-hang. Best-effort.
+	if remote, err := ParseRemote(s.Remote); err == nil {
+		remote.closeMaster()
+	}
+
 	// Initial sync pass.
 	if err := runSyncEntry(s, dryRun, true); err != nil {
 		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)

@@ -3,6 +3,7 @@ package syncengine
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,12 +65,31 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 // multiplexing means the first call opens a master connection that subsequent
 // calls (scans, transfers, deletes) reuse, eliminating per-op handshake cost;
 // the master lingers 60s past the last use.
+//
+// The ControlPath is scoped to THIS process (its pid), not just the SSH target.
+// A bare `%r@%h-%p` path is shared by every caravan process syncing to the same
+// host, so one process's closeMaster (`ssh -O exit`) or restart would tear down
+// a master another process is actively using. Per-pid isolation also means a
+// restarted daemon gets a fresh path and cannot inherit a stale master left by
+// its predecessor.
+//
+// Keepalive is essential, not optional. Without ServerAliveInterval a half-open
+// TCP connection — the normal aftermath of a laptop sleeping or tailscale
+// re-keying — leaves an ssh read() blocking FOREVER, and a single half-open
+// master silently freezes the whole watch loop until the process is killed
+// (observed 2026-08-13: a 7-hour stall after the Mac slept). With these set, ssh
+// detects a dead peer in ~45s (15s × 3) and exits with an error the daemon's
+// backoff/retry already handles; the master self-recycles because the option
+// applies to the master connection too.
 func sshBaseArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
 		"-o", "ControlPersist=60s",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "ConnectTimeout=10",
 	}
 }
 
@@ -77,6 +97,30 @@ func sshBaseArgs() []string {
 func sshCommand(host, remoteCmd string) *exec.Cmd {
 	args := append(sshBaseArgs(), host, remoteCmd)
 	return exec.Command("ssh", args...)
+}
+
+// sshCommandContext is sshCommand bound to a context, so a caller can hard-cap a
+// blocking ssh (the long-poll scan) as a backstop even if keepalive misses.
+func sshCommandContext(ctx context.Context, host, remoteCmd string) *exec.Cmd {
+	args := append(sshBaseArgs(), host, remoteCmd)
+	return exec.CommandContext(ctx, "ssh", args...)
+}
+
+// closeMaster tears down the shared ControlMaster for this host via `ssh -O
+// exit`, so the next ssh establishes a fresh connection. Keepalive only recycles
+// a master that a keepalive-aware process created; a stale master left by a
+// pre-keepalive process (or wedged before its probes fired) persists at the
+// fixed ControlPath and would be *reused* by a retry or a restart, re-hanging
+// immediately. Reaping it at startup and after a long-poll timeout closes that
+// gap. Best-effort: "no master running" is the normal, ignored outcome.
+func (r *RemoteConn) closeMaster() {
+	if r.Kind != transportSSH || r.Host == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	args := append(sshBaseArgs(), "-O", "exit", r.Host)
+	_ = exec.CommandContext(ctx, "ssh", args...).Run()
 }
 
 // sshCarrier is the -e argument handed to rsync.
@@ -207,12 +251,30 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	windowStr := window.Round(time.Millisecond).String()
 	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr)
 
-	cmd := sshCommand(r.Host, cmdStr)
+	// Hard-cap the long-poll so a hung ssh read can never freeze the watch loop
+	// indefinitely. Keepalive (sshBaseArgs) is the PRIMARY defense: it kills a
+	// dead peer in ~45s, and the ssh server keeps answering keepalive probes even
+	// while a slow remote scan computes, so keepalive never false-fires on a
+	// healthy-but-slow scan. This context is only the backstop for a non-network
+	// hang, so it must stay generous enough never to trip on a legitimately slow
+	// long-poll: a large or checksummed remote tree can take several full scans
+	// and run well past window+60s (window itself is only ~20s). A few minutes of
+	// headroom keeps a real non-network hang bounded while leaving healthy slow
+	// scans alone.
+	ctx, cancel := context.WithTimeout(context.Background(), window+3*time.Minute)
+	defer cancel()
+	cmd := sshCommandContext(ctx, r.Host, cmdStr)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Run(); err != nil {
+		// A timeout means the long-poll wedged (a half-open master is the usual
+		// cause). Tear the master down so the next attempt reconnects fresh
+		// instead of reusing the same stuck socket.
+		if ctx.Err() != nil {
+			r.closeMaster()
+		}
 		return nil, true, fmt.Errorf("remote wait-scan on %s: %w (stderr: %s)", r.Host, err, stderrBuf.String())
 	}
 
