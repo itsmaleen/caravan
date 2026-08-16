@@ -140,9 +140,13 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 	const backoffBase = 5 * time.Second
 	const backoffMax = 60 * time.Second
 
+	// Warn if the per-uid ssh socket dir is not ours at 0700 (a pre-created
+	// hijack setup on a shared machine); non-fatal.
+	verifySockDir()
+
 	// Clear any stale ControlMaster left by a previous (possibly pre-keepalive)
 	// process before the first op, so a restart can't inherit a half-open master
-	// at the shared ControlPath and immediately re-hang. Best-effort.
+	// and immediately re-hang. Best-effort.
 	if remote, err := ParseRemote(s.Remote); err == nil {
 		remote.closeMaster()
 	}
@@ -379,10 +383,10 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 //
 // The action slice is already sorted by sortActions:
 //
-//	0. preDeleteLocal/preDeleteRemote (deepest first) — run inline immediately
-//	1. mkdirLocal/mkdirRemote (shallow first) — run inline immediately
-//	2. push/pull — batched then executed
-//	3. deleteLocal/deleteRemote (deepest first) — batched then executed
+//  0. preDeleteLocal/preDeleteRemote (deepest first) — run inline immediately
+//  1. mkdirLocal/mkdirRemote (shallow first) — run inline immediately
+//  2. push/pull — batched then executed
+//  3. deleteLocal/deleteRemote (deepest first) — batched then executed
 //
 // Pre-deletes are executed inline as they are encountered so that the
 // subsequent mkdir/push/pull operations find a clean slate.
@@ -746,7 +750,7 @@ func backupRemoteLoser(syncName string, remote *RemoteConn, rel string) int {
 			quotePath(remoteSrc),
 			quotePath(remoteDst),
 		)
-		if err := sshCommand(remote.Host, cmd).Run(); err != nil {
+		if err := remote.sshCommand(cmd).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "conflict backup remote %s: %v\n", rel, err)
 			return 0
 		}

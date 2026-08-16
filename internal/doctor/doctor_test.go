@@ -621,7 +621,7 @@ func TestSSHDoctorArgsKeepalive(t *testing.T) {
 		"ServerAliveInterval=15",
 		"ServerAliveCountMax=3",
 		"ConnectTimeout=5",
-		fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+		fmt.Sprintf("ControlPath=/tmp/caravan-%d/dr-%d-%%r@%%h-%%p", os.Getuid(), os.Getpid()),
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("sshDoctorArgs() missing %q\n  got: %s", want, args)

@@ -319,10 +319,18 @@ func checkLocalRemote(label, root string) []result {
 // in syncengine, so we duplicate the small list here — keep the keepalive
 // options in sync with it.
 func sshDoctorArgs() []string {
+	// Mirror syncengine.sockDir: a per-user 0700 dir keeps the ControlMaster
+	// socket out of world-writable /tmp root, where another local user could
+	// pre-bind a predictable path and hijack the mux. Diagnostic probes are
+	// one-shot, so a pid-scoped socket name (no per-entry hash) is enough.
+	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
+	cp := filepath.Join(dir, fmt.Sprintf("dr-%d-%%r@%%h-%%p", os.Getpid()))
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+		"-o", "ControlPath=" + cp,
 		"-o", "ControlPersist=60s",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",

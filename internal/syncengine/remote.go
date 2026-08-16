@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"caravan/internal/buildinfo"
@@ -29,9 +31,9 @@ const (
 
 // RemoteConn describes and operates on one side of a sync pair.
 type RemoteConn struct {
-	Kind    transportKind
-	Host    string // SSH: user@host; Local: ""
-	Root    string // absolute-ish remote root path (may start with ~)
+	Kind transportKind
+	Host string // SSH: user@host; Local: ""
+	Root string // absolute-ish remote root path (may start with ~)
 }
 
 // ParseRemote parses a remote spec into a RemoteConn.
@@ -60,18 +62,61 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 	return &RemoteConn{Kind: transportSSH, Host: host, Root: path}, nil
 }
 
+// sockDir is a per-user 0700 directory for ControlMaster sockets. Placing them
+// here instead of in world-writable /tmp root stops another local user from
+// pre-binding a predictable socket path and hijacking the ssh mux, which speaks
+// an unauthenticated protocol. Kept short (under /tmp, not the long macOS
+// $TMPDIR) so the expanded socket path stays under the ~104-char unix limit.
+// Best-effort: MkdirAll is idempotent and Chmod re-tightens a dir that
+// pre-existed with a looser mode (Chmod fails silently if another user owns it —
+// verifySockDir surfaces that at startup).
+func sockDir() string {
+	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
+	return dir
+}
 
-// sshBaseArgs are the options applied to every ssh invocation. ControlMaster
-// multiplexing means the first call opens a master connection that subsequent
-// calls (scans, transfers, deletes) reuse, eliminating per-op handshake cost;
-// the master lingers 60s past the last use.
-//
-// The ControlPath is scoped to THIS process (its pid), not just the SSH target.
-// A bare `%r@%h-%p` path is shared by every caravan process syncing to the same
-// host, so one process's closeMaster (`ssh -O exit`) or restart would tear down
-// a master another process is actively using. Per-pid isolation also means a
-// restarted daemon gets a fresh path and cannot inherit a stale master left by
-// its predecessor.
+// verifySockDir warns once, at startup, if the socket dir is not a directory we
+// own at mode 0700 — the signature of a pre-created hijack attempt on a shared
+// machine. Non-fatal on purpose: a warning beats a denial of service in which
+// any local user wedges the daemon by creating the dir first.
+func verifySockDir() {
+	dir := sockDir()
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return
+	}
+	bad := !fi.IsDir() || fi.Mode().Perm() != 0o700
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		bad = true
+	}
+	if bad {
+		fmt.Fprintf(os.Stderr, "caravan: WARNING ssh control-socket dir %s is not owned by you at 0700; another local user may be able to hijack the ssh master\n", dir)
+	}
+}
+
+// shortHash is a stable 8-hex-char digest, used to give each sync entry its own
+// ControlPath without blowing past the ~104-char unix-socket path limit.
+func shortHash(s string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return fmt.Sprintf("%08x", h.Sum32())
+}
+
+// controlPath is the ssh ControlMaster socket for THIS process and THIS sync
+// entry. It embeds the pid — so a restart, or another caravan process, can
+// neither inherit nor disturb this master — and a hash of host+root, so two
+// entries to the same host within one process do NOT share a master (one entry's
+// closeMaster must never abort another's in-flight transfer). It lives under the
+// 0700 sockDir. %r/%h/%p are expanded by ssh at connect time.
+func (r *RemoteConn) controlPath() string {
+	return filepath.Join(sockDir(), fmt.Sprintf("s-%d-%s-%%r@%%h-%%p", os.Getpid(), shortHash(r.Host+"|"+r.Root)))
+}
+
+// sshBaseArgs are the options applied to every ssh invocation, given the caller's
+// per-entry controlPath. ControlMaster multiplexing means the first call opens a
+// master connection that subsequent calls (scans, transfers, deletes) reuse.
 //
 // Keepalive is essential, not optional. Without ServerAliveInterval a half-open
 // TCP connection — the normal aftermath of a laptop sleeping or tailscale
@@ -81,11 +126,11 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 // detects a dead peer in ~45s (15s × 3) and exits with an error the daemon's
 // backoff/retry already handles; the master self-recycles because the option
 // applies to the master connection too.
-func sshBaseArgs() []string {
+func sshBaseArgs(controlPath string) []string {
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+		"-o", "ControlPath=" + controlPath,
 		"-o", "ControlPersist=60s",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
@@ -93,39 +138,39 @@ func sshBaseArgs() []string {
 	}
 }
 
-// sshCommand builds an ssh exec.Cmd for host running remoteCmd.
-func sshCommand(host, remoteCmd string) *exec.Cmd {
-	args := append(sshBaseArgs(), host, remoteCmd)
+// sshCommand builds an ssh exec.Cmd running remoteCmd against this entry's host.
+func (r *RemoteConn) sshCommand(remoteCmd string) *exec.Cmd {
+	args := append(sshBaseArgs(r.controlPath()), r.Host, remoteCmd)
 	return exec.Command("ssh", args...)
 }
 
 // sshCommandContext is sshCommand bound to a context, so a caller can hard-cap a
 // blocking ssh (the long-poll scan) as a backstop even if keepalive misses.
-func sshCommandContext(ctx context.Context, host, remoteCmd string) *exec.Cmd {
-	args := append(sshBaseArgs(), host, remoteCmd)
+func (r *RemoteConn) sshCommandContext(ctx context.Context, remoteCmd string) *exec.Cmd {
+	args := append(sshBaseArgs(r.controlPath()), r.Host, remoteCmd)
 	return exec.CommandContext(ctx, "ssh", args...)
 }
 
-// closeMaster tears down the shared ControlMaster for this host via `ssh -O
-// exit`, so the next ssh establishes a fresh connection. Keepalive only recycles
-// a master that a keepalive-aware process created; a stale master left by a
-// pre-keepalive process (or wedged before its probes fired) persists at the
-// fixed ControlPath and would be *reused* by a retry or a restart, re-hanging
-// immediately. Reaping it at startup and after a long-poll timeout closes that
-// gap. Best-effort: "no master running" is the normal, ignored outcome.
+// closeMaster tears down THIS entry's ControlMaster via `ssh -O exit`, so the
+// next ssh establishes a fresh connection. Keepalive only recycles a master a
+// keepalive-aware process created; a stale master left by a pre-keepalive process
+// (or wedged before its probes fired) would be *reused* by a retry or a restart,
+// re-hanging immediately. Reaping it at startup and after a long-poll timeout
+// closes that gap. Best-effort: "no master running" is the normal, ignored
+// outcome, and the per-entry controlPath means this only touches our own master.
 func (r *RemoteConn) closeMaster() {
 	if r.Kind != transportSSH || r.Host == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	args := append(sshBaseArgs(), "-O", "exit", r.Host)
+	args := append(sshBaseArgs(r.controlPath()), "-O", "exit", r.Host)
 	_ = exec.CommandContext(ctx, "ssh", args...).Run()
 }
 
-// sshCarrier is the -e argument handed to rsync.
-func sshCarrier() string {
-	return "ssh " + strings.Join(sshBaseArgs(), " ")
+// sshCarrier is the -e argument handed to rsync for this entry.
+func (r *RemoteConn) sshCarrier() string {
+	return "ssh " + strings.Join(sshBaseArgs(r.controlPath()), " ")
 }
 
 // --- Scan ---
@@ -156,7 +201,7 @@ func (r *RemoteConn) scanLocal(excludes []string, hashFiles bool) (map[string]En
 func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap bool) (map[string]Entry, error) {
 	cmd := r.buildScanCmdStr(excludes, hashFiles, "")
 
-	out, err := sshCommand(r.Host, cmd).Output()
+	out, err := r.sshCommand(cmd).Output()
 	if err != nil {
 		if allowBootstrap && looksLikeMissingBinary(err, out) {
 			fmt.Fprintf(os.Stderr, "caravan: remote binary not found on %s; bootstrapping…\n", r.Host)
@@ -263,7 +308,7 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	// scans alone.
 	ctx, cancel := context.WithTimeout(context.Background(), window+3*time.Minute)
 	defer cancel()
-	cmd := sshCommandContext(ctx, r.Host, cmdStr)
+	cmd := r.sshCommandContext(ctx, cmdStr)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
@@ -331,7 +376,7 @@ func looksLikeMissingDir(err error, _ []byte) bool {
 // bootstrap copies the current executable to ~/.local/bin/caravan on the remote.
 func (r *RemoteConn) bootstrap() error {
 	// Verify architecture matches.
-	uname, err := sshCommand(r.Host, "uname -sm").Output()
+	uname, err := r.sshCommand("uname -sm").Output()
 	if err != nil {
 		return fmt.Errorf("uname check: %w", err)
 	}
@@ -351,7 +396,7 @@ func (r *RemoteConn) bootstrap() error {
 	}
 	defer exeFile.Close()
 
-	install := sshCommand(r.Host, `mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
+	install := r.sshCommand(`mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
 	install.Stdin = exeFile
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -429,7 +474,7 @@ func (r *RemoteConn) MkdirAll(rel string) error {
 func (r *RemoteConn) mkdirSSH(rel string) error {
 	target := absoluteRemotePath(r.Root, rel)
 	cmd := fmt.Sprintf("mkdir -p %s", shellRemotePath(target))
-	return sshCommand(r.Host, cmd).Run()
+	return r.sshCommand(cmd).Run()
 }
 
 // --- Push (local → remote) ---
@@ -512,7 +557,7 @@ func (r *RemoteConn) pushSSH(localRoot string, paths []string) error {
 	sshScript := fmt.Sprintf(`mkdir -p %s && %s`, remoteRoot, stagedExtractScript(remoteRoot))
 
 	tarCmd := exec.Command("tar", "-C", localRoot, "-cf", "-", "-T", tmpList.Name())
-	sshCmd := sshCommand(r.Host, sshScript)
+	sshCmd := r.sshCommand(sshScript)
 
 	pr, pw := io.Pipe()
 	tarCmd.Stdout = pw
@@ -599,7 +644,7 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 		return fmt.Errorf("ssh pull: mkdir staging: %w", err)
 	}
 
-	sshCmd := sshCommand(r.Host, sshScript)
+	sshCmd := r.sshCommand(sshScript)
 	sshCmd.Stdin = strings.NewReader(listData)
 	sshCmd.Stderr = os.Stderr
 
@@ -717,7 +762,7 @@ func (r *RemoteConn) deleteSSH(paths []string, recursive bool) error {
 		args = append(args, abs)
 	}
 	cmd := "rm " + strings.Join(args, " ")
-	return sshCommand(r.Host, cmd).Run()
+	return r.sshCommand(cmd).Run()
 }
 
 // --- Rsync delta transfer ---
@@ -734,9 +779,9 @@ func (r *RemoteConn) deleteSSH(paths []string, recursive bool) error {
 // Remote paths that start with ~/ are converted to "$HOME/…" so the shell
 // expands them correctly inside the single-quoted argument wrapper we use;
 // for paths that start with ~/ we switch to double-quotes to allow $HOME.
-func rsyncArgs(push bool, host, localPath, remotePath string) []string {
-	remote := formatRsyncRemotePath(host, remotePath)
-	args := []string{"-pt", "-e", sshCarrier()}
+func (r *RemoteConn) rsyncArgs(push bool, localPath, remotePath string) []string {
+	remote := formatRsyncRemotePath(r.Host, remotePath)
+	args := []string{"-pt", "-e", r.sshCarrier()}
 	if push {
 		args = append(args, localPath, remote)
 	} else {
@@ -785,7 +830,7 @@ func (r *RemoteConn) PushDelta(localRoot string, paths []string) error {
 				return fmt.Errorf("rsync push mkdir remote parent %s: %w", parentRel, err)
 			}
 
-			args := rsyncArgs(true, r.Host, localPath, remotePath)
+			args := r.rsyncArgs(true, localPath, remotePath)
 			cmd := exec.Command("rsync", args...)
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
@@ -818,7 +863,7 @@ func (r *RemoteConn) PullDelta(localRoot string, paths []string) error {
 				return fmt.Errorf("rsync pull mkdir local parent %s: %w", filepath.Dir(localPath), err)
 			}
 
-			args := rsyncArgs(false, r.Host, localPath, remotePath)
+			args := r.rsyncArgs(false, localPath, remotePath)
 			cmd := exec.Command("rsync", args...)
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
@@ -880,7 +925,7 @@ func (r *RemoteConn) chmodSSH(pairs []ChmodPair) error {
 		parts = append(parts, fmt.Sprintf("chmod %04o %s", cp.Mode, quoteAbs(abs)))
 	}
 	cmd := strings.Join(parts, " && ")
-	return sshCommand(r.Host, cmd).Run()
+	return r.sshCommand(cmd).Run()
 }
 
 // --- Helpers ---
