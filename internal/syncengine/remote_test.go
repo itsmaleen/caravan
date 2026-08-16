@@ -255,10 +255,16 @@ func TestSSHBaseArgsKeepalive(t *testing.T) {
 // sockDir, so concurrent processes and sibling entries never share — nor tear
 // down — one another's ssh master.
 func TestControlPathIsolation(t *testing.T) {
-	a := (&RemoteConn{Kind: transportSSH, Host: "m@host", Root: "~/one"}).controlPath()
-	b := (&RemoteConn{Kind: transportSSH, Host: "m@host", Root: "~/two"}).controlPath()
+	if err := EnsureSecureSockDir(); err != nil {
+		t.Fatalf("EnsureSecureSockDir: %v", err)
+	}
+	// Same remote, DIFFERENT entry names must not share a socket — unique names
+	// are the only guaranteed key (the manifest does not require unique remotes),
+	// so keying by host+root would wrongly collide them.
+	a := (&RemoteConn{Kind: transportSSH, Name: "alpha", Host: "u@host", Root: "/shared"}).controlPath()
+	b := (&RemoteConn{Kind: transportSSH, Name: "beta", Host: "u@host", Root: "/shared"}).controlPath()
 	if a == b {
-		t.Errorf("two entries to the same host share a ControlPath: %s", a)
+		t.Errorf("distinct entries (same remote) share a ControlPath: %s", a)
 	}
 	dir := sockDir()
 	if !strings.HasPrefix(a, dir+"/") {

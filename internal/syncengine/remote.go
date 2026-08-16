@@ -4,9 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
@@ -34,6 +35,7 @@ type RemoteConn struct {
 	Kind transportKind
 	Host string // SSH: user@host; Local: ""
 	Root string // absolute-ish remote root path (may start with ~)
+	Name string // sync entry name; keys the per-entry ssh ControlPath
 }
 
 // ParseRemote parses a remote spec into a RemoteConn.
@@ -62,56 +64,58 @@ func ParseRemote(spec string) (*RemoteConn, error) {
 	return &RemoteConn{Kind: transportSSH, Host: host, Root: path}, nil
 }
 
-// sockDir is a per-user 0700 directory for ControlMaster sockets. Placing them
-// here instead of in world-writable /tmp root stops another local user from
-// pre-binding a predictable socket path and hijacking the ssh mux, which speaks
-// an unauthenticated protocol. Kept short (under /tmp, not the long macOS
-// $TMPDIR) so the expanded socket path stays under the ~104-char unix limit.
-// Best-effort: MkdirAll is idempotent and Chmod re-tightens a dir that
-// pre-existed with a looser mode (Chmod fails silently if another user owns it —
-// verifySockDir surfaces that at startup).
+// sockDir is a per-user directory for ssh ControlMaster sockets, kept out of
+// world-writable /tmp root so another local user cannot pre-bind a predictable
+// socket path and hijack the ssh mux (which speaks an unauthenticated protocol).
+// Kept short (under /tmp, not the long macOS $TMPDIR) so the expanded socket path
+// stays under the ~104-char unix limit. This only returns the path;
+// EnsureSecureSockDir is the fail-closed gate callers must run first.
 func sockDir() string {
-	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+	return filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+}
+
+// ensureSecureSockDir creates the socket dir 0700 and then *verifies* it is a
+// real directory we own at exactly mode 0700, returning an error otherwise. It
+// is fail-closed by design: MkdirAll happily accepts a dir another user
+// pre-created, and Chmod cannot tighten a dir we do not own, so without this
+// check ssh would route through an attacker-controlled, unauthenticated mux
+// socket — worse than refusing to sync. Every entry point that opens an ssh
+// ControlMaster (sync, doctor) must call this before the first op.
+func EnsureSecureSockDir() error {
+	dir := sockDir()
 	_ = os.MkdirAll(dir, 0o700)
 	_ = os.Chmod(dir, 0o700)
-	return dir
-}
-
-// verifySockDir warns once, at startup, if the socket dir is not a directory we
-// own at mode 0700 — the signature of a pre-created hijack attempt on a shared
-// machine. Non-fatal on purpose: a warning beats a denial of service in which
-// any local user wedges the daemon by creating the dir first.
-func verifySockDir() {
-	dir := sockDir()
 	fi, err := os.Lstat(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("ssh control-socket dir %s: %w", dir, err)
 	}
-	bad := !fi.IsDir() || fi.Mode().Perm() != 0o700
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		return fmt.Errorf("ssh control-socket dir %s is not a private (0700) directory; refusing to use it", dir)
+	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
-		bad = true
+		return fmt.Errorf("ssh control-socket dir %s is owned by uid %d, not you; refusing to use it", dir, st.Uid)
 	}
-	if bad {
-		fmt.Fprintf(os.Stderr, "caravan: WARNING ssh control-socket dir %s is not owned by you at 0700; another local user may be able to hijack the ssh master\n", dir)
-	}
+	return nil
 }
 
-// shortHash is a stable 8-hex-char digest, used to give each sync entry its own
-// ControlPath without blowing past the ~104-char unix-socket path limit.
-func shortHash(s string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(s))
-	return fmt.Sprintf("%08x", h.Sum32())
+// entryKey is a stable, collision-resistant digest of a sync entry's unique name,
+// giving each entry its own ControlPath without exceeding the ~104-char
+// unix-socket path limit. SHA-256 (truncated), not a 32-bit hash: distinct
+// entries must never collide onto one socket, or one entry's closeMaster would
+// tear down another entry's master.
+func entryKey(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:6])
 }
 
 // controlPath is the ssh ControlMaster socket for THIS process and THIS sync
 // entry. It embeds the pid — so a restart, or another caravan process, can
-// neither inherit nor disturb this master — and a hash of host+root, so two
-// entries to the same host within one process do NOT share a master (one entry's
-// closeMaster must never abort another's in-flight transfer). It lives under the
+// neither inherit nor disturb this master — and a digest of the entry's UNIQUE
+// NAME, so two entries never share a master even when they target the same remote
+// (the manifest guarantees unique names, not unique remotes). Lives under the
 // 0700 sockDir. %r/%h/%p are expanded by ssh at connect time.
 func (r *RemoteConn) controlPath() string {
-	return filepath.Join(sockDir(), fmt.Sprintf("s-%d-%s-%%r@%%h-%%p", os.Getpid(), shortHash(r.Host+"|"+r.Root)))
+	return filepath.Join(sockDir(), fmt.Sprintf("s-%d-%s-%%r@%%h-%%p", os.Getpid(), entryKey(r.Name)))
 }
 
 // sshBaseArgs are the options applied to every ssh invocation, given the caller's
@@ -314,12 +318,12 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 	cmd.Stderr = &stderrBuf
 
 	if err := cmd.Run(); err != nil {
-		// A timeout means the long-poll wedged (a half-open master is the usual
-		// cause). Tear the master down so the next attempt reconnects fresh
-		// instead of reusing the same stuck socket.
-		if ctx.Err() != nil {
-			r.closeMaster()
-		}
+		// Do NOT closeMaster here on timeout: a superseded WaitScan (left running
+		// after a local change triggered an immediate sync) shares this entry's
+		// master with that in-flight sync, and `ssh -O exit` would abort its
+		// transfer. exec.CommandContext already killed this passenger ssh; a truly
+		// half-open master is caught by keepalive (~45s), and the startup reap
+		// handles a stale master on restart.
 		return nil, true, fmt.Errorf("remote wait-scan on %s: %w (stderr: %s)", r.Host, err, stderrBuf.String())
 	}
 

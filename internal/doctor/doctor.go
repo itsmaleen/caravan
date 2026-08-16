@@ -342,6 +342,16 @@ func sshDoctorArgs() []string {
 func checkSSHRemote(label, host, root string) []result {
 	var out []result
 
+	// Fail closed if the ssh ControlMaster dir isn't a private 0700 dir we own —
+	// otherwise every probe below could route through another local user's mux.
+	if err := syncengine.EnsureSecureSockDir(); err != nil {
+		out = append(out, result{label, "ssh control-socket dir", statusFail, err.Error()})
+		for _, c := range []string{"remote reachable", "remote caravan version", "remote dir"} {
+			out = append(out, result{label, c, statusNA, "skipped (insecure control-socket dir)"})
+		}
+		return out
+	}
+
 	// 1. Reachability: ssh <host> true
 	reachArgs := append(sshDoctorArgs(), host, "true")
 	_, err := runCmd("ssh", reachArgs...)

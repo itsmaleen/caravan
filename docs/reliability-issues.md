@@ -100,17 +100,23 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
   entry and whenever the long-poll times out, so a restart or retry can't inherit
   a half-open master and re-hang. This is what `exec.CommandContext` alone could
   not do — it kills the passenger ssh, not the persistent master.
-- **[FIXED, #2] Private, per-process, per-entry `ControlPath`.** The socket now
-  lives at `/tmp/caravan-<uid>/s-<pid>-<hash(host+root)>-%r@%h-%p`, where the dir
-  is `0700`-owned by the user (`verifySockDir` warns at startup if it isn't). This
-  (a) closes the world-writable-`/tmp` mux-hijack surfaced by cross-model review —
-  the socket speaks an unauthenticated protocol, so another local user who
-  pre-binds a predictable `/tmp` path could MITM it; (b) isolates unrelated
-  processes via the pid; and (c) isolates sibling entries in one process via the
-  host+root hash, so one entry's `closeMaster` can't abort another's transfer.
-  Kept under `/tmp` (not macOS's long `$TMPDIR`) to stay within the ~104-char
-  unix-socket path limit. (Trade-off: separate processes/entries no longer share a
-  master — a negligible handshake cost for the isolation.)
+- **[FIXED, #2] Private, per-process, per-entry `ControlPath`.** The socket lives
+  at `/tmp/caravan-<uid>/s-<pid>-<sha256(entry-name)[:12]>-%r@%h-%p`, in a `0700`
+  dir the user owns. `EnsureSecureSockDir` is **fail-closed** — called before any
+  ssh op in both one-shot and watch sync (and in `doctor`), it refuses to proceed
+  if the dir isn't a private directory we own at 0700. This (a) closes the
+  world-writable-`/tmp` mux-hijack (the socket speaks an unauthenticated protocol,
+  so another local user who pre-binds a predictable path could MITM it — MkdirAll
+  accepts a pre-created dir and Chmod can't tighten one we don't own, so a warning
+  wasn't enough); (b) isolates unrelated processes via the pid; and (c) isolates
+  entries via a **SHA-256 digest of the entry's unique name** — keyed by name, not
+  host+root, because the manifest allows two entries to share a remote, and a
+  32-bit hash collides (both defects were caught by cross-review). One entry's
+  `closeMaster` therefore can't abort another's transfer. Also dropped the
+  on-timeout `closeMaster`: a superseded WaitScan shares its entry's master with
+  the in-flight sync, so tearing it down mid-transfer was wrong; keepalive (~45s)
+  and the startup reap cover the wedged/stale cases. Kept under `/tmp` (not macOS's
+  long `$TMPDIR`) to stay within the ~104-char unix-socket path limit.
 - **[IDEA] Conflict backups accumulate silently.** `~/.config/caravan/conflicts/`
   had 11 stale backups (a rapidly-rewritten `signal/.state/domains.json` churned
   many; plus one from a hand-rsync racing the daemon). Consider pruning old

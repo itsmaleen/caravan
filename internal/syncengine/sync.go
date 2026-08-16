@@ -81,6 +81,14 @@ func CmdSync(args []string) int {
 		}
 	}
 
+	// Fail closed if the per-uid ssh ControlMaster dir isn't a private 0700 dir
+	// we own — otherwise ssh could route through another local user's mux socket.
+	// Covers both one-shot and watch before any ssh op runs.
+	if err := EnsureSecureSockDir(); err != nil {
+		fmt.Fprintf(os.Stderr, "sync: %v\n", err)
+		return 1
+	}
+
 	if !*watch {
 		code := 0
 		for _, s := range entries {
@@ -140,14 +148,10 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 	const backoffBase = 5 * time.Second
 	const backoffMax = 60 * time.Second
 
-	// Warn if the per-uid ssh socket dir is not ours at 0700 (a pre-created
-	// hijack setup on a shared machine); non-fatal.
-	verifySockDir()
-
 	// Clear any stale ControlMaster left by a previous (possibly pre-keepalive)
 	// process before the first op, so a restart can't inherit a half-open master
 	// and immediately re-hang. Best-effort.
-	if remote, err := ParseRemote(s.Remote); err == nil {
+	if remote, err := parseSyncRemote(s); err == nil {
 		remote.closeMaster()
 	}
 
@@ -167,7 +171,7 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 
 	for {
 		// Parse remote to run WaitScan.
-		remote, err := ParseRemote(s.Remote)
+		remote, err := parseSyncRemote(s)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sync %s: parse remote: %v\n", s.Name, err)
 			// Wait for signal or sleep before retry.
@@ -289,7 +293,7 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 		return fmt.Errorf("mkdir local %s: %w", localRoot, err)
 	}
 
-	remote, err := ParseRemote(s.Remote)
+	remote, err := parseSyncRemote(s)
 	if err != nil {
 		return err
 	}
@@ -878,4 +882,16 @@ func countFiles(entries map[string]Entry) int {
 
 func localJoin(root, rel string) string {
 	return root + string(os.PathSeparator) + strings.ReplaceAll(rel, "/", string(os.PathSeparator))
+}
+
+// parseSyncRemote is ParseRemote plus the entry name, which keys the per-entry
+// ssh ControlPath (RemoteConn.controlPath) so distinct entries never share a
+// master even when they target the same remote.
+func parseSyncRemote(s manifest.Sync) (*RemoteConn, error) {
+	r, err := ParseRemote(s.Remote)
+	if err != nil {
+		return nil, err
+	}
+	r.Name = s.Name
+	return r, nil
 }
