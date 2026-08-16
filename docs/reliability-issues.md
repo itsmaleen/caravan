@@ -80,12 +80,11 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
 
 ## Standing issues & improvement ideas (found along the way)
 
-- **[PARTLY FIXED, 0.6.1] Single ControlMaster mux as a SPOF.** One dead master
-  hangs every op sharing it. Keepalive now recycles it and the `ControlPath` is
-  now per-process (above), so unrelated caravan *processes* no longer share a
-  master. Still open: within one process, multiple sync entries to the same host
-  still share a master; a periodic master health-ping would catch a wedge faster
-  than the long-poll timeout.
+- **[FIXED, #2] Single ControlMaster mux as a SPOF.** One dead master hangs every
+  op sharing it. Keepalive recycles it, and the `ControlPath` is now scoped by
+  process *and* by entry (below), so neither unrelated processes nor sibling
+  entries in one process share a master. Remaining idea: a periodic master
+  health-ping would catch a wedge faster than the long-poll timeout.
 - **[IDEA] The daemon emits no idle heartbeat.** When there are no changes it
   logs nothing, so log-staleness is useless for external liveness monitoring
   (the client watchdog had to detect a stuck *ssh* instead). A cheap periodic
@@ -101,13 +100,23 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
   entry and whenever the long-poll times out, so a restart or retry can't inherit
   a half-open master and re-hang. This is what `exec.CommandContext` alone could
   not do — it kills the passenger ssh, not the persistent master.
-- **[FIXED, 0.6.1] Per-process `ControlPath`.** The socket path now embeds the
-  pid (`/tmp/caravan-ssh-<pid>-%r@%h-%p`) rather than being shared by every
-  caravan process syncing to the same host, so one process's `closeMaster` or
-  restart can no longer tear down a master another process is actively using, and
-  a restarted daemon gets a fresh path it cannot inherit a stale master from.
-  (Trade-off: separate caravan processes to the same host no longer share one
-  master — a negligible per-process handshake cost for the isolation.)
+- **[FIXED, #2] Private, per-process, per-entry `ControlPath`.** The socket lives
+  at `/tmp/caravan-<uid>/s-<pid>-<sha256(entry-name)[:12]>-%r@%h-%p`, in a `0700`
+  dir the user owns. `EnsureSecureSockDir` is **fail-closed** — called before any
+  ssh op in both one-shot and watch sync (and in `doctor`), it refuses to proceed
+  if the dir isn't a private directory we own at 0700. This (a) closes the
+  world-writable-`/tmp` mux-hijack (the socket speaks an unauthenticated protocol,
+  so another local user who pre-binds a predictable path could MITM it — MkdirAll
+  accepts a pre-created dir and Chmod can't tighten one we don't own, so a warning
+  wasn't enough); (b) isolates unrelated processes via the pid; and (c) isolates
+  entries via a **SHA-256 digest of the entry's unique name** — keyed by name, not
+  host+root, because the manifest allows two entries to share a remote, and a
+  32-bit hash collides (both defects were caught by cross-review). One entry's
+  `closeMaster` therefore can't abort another's transfer. Also dropped the
+  on-timeout `closeMaster`: a superseded WaitScan shares its entry's master with
+  the in-flight sync, so tearing it down mid-transfer was wrong; keepalive (~45s)
+  and the startup reap cover the wedged/stale cases. Kept under `/tmp` (not macOS's
+  long `$TMPDIR`) to stay within the ~104-char unix-socket path limit.
 - **[IDEA] Conflict backups accumulate silently.** `~/.config/caravan/conflicts/`
   had 11 stale backups (a rapidly-rewritten `signal/.state/domains.json` churned
   many; plus one from a hand-rsync racing the daemon). Consider pruning old

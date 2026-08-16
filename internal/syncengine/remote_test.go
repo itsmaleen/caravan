@@ -234,18 +234,49 @@ func TestCopyFile_Atomic_ModePreserved(t *testing.T) {
 
 // TestSSHBaseArgsKeepalive pins the ssh reliability options so they cannot
 // silently regress: dropping ServerAliveInterval reintroduces the sleep-induced
-// watch-loop hang, and dropping the pid from ControlPath un-isolates concurrent
-// caravan processes sharing a host.
+// watch-loop hang. The ControlPath is supplied by the caller (per-entry).
 func TestSSHBaseArgsKeepalive(t *testing.T) {
-	args := strings.Join(sshBaseArgs(), " ")
+	cp := "/tmp/caravan-1/s-2-deadbeef-%r@%h-%p"
+	args := strings.Join(sshBaseArgs(cp), " ")
 	for _, want := range []string{
 		"ServerAliveInterval=15",
 		"ServerAliveCountMax=3",
 		"ConnectTimeout=10",
-		fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+		"ControlPath=" + cp,
 	} {
 		if !strings.Contains(args, want) {
 			t.Errorf("sshBaseArgs() missing %q\n  got: %s", want, args)
 		}
+	}
+}
+
+// TestControlPathIsolation pins the socket-isolation invariants: the path is
+// scoped by process (pid) AND by entry (host+root), lives under the per-uid 0700
+// sockDir, so concurrent processes and sibling entries never share — nor tear
+// down — one another's ssh master.
+func TestControlPathIsolation(t *testing.T) {
+	if err := EnsureSecureSockDir(); err != nil {
+		t.Fatalf("EnsureSecureSockDir: %v", err)
+	}
+	// Same remote, DIFFERENT entry names must not share a socket — unique names
+	// are the only guaranteed key (the manifest does not require unique remotes),
+	// so keying by host+root would wrongly collide them.
+	a := (&RemoteConn{Kind: transportSSH, Name: "alpha", Host: "u@host", Root: "/shared"}).controlPath()
+	b := (&RemoteConn{Kind: transportSSH, Name: "beta", Host: "u@host", Root: "/shared"}).controlPath()
+	if a == b {
+		t.Errorf("distinct entries (same remote) share a ControlPath: %s", a)
+	}
+	dir := sockDir()
+	if !strings.HasPrefix(a, dir+"/") {
+		t.Errorf("ControlPath %q is not under sockDir %q", a, dir)
+	}
+	if !strings.Contains(a, fmt.Sprintf("s-%d-", os.Getpid())) {
+		t.Errorf("ControlPath %q is missing pid scoping", a)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("sockDir %q is not 0700 (err=%v)", dir, err)
+	}
+	if len(strings.ReplaceAll(a, "%", "")) > 104 {
+		t.Errorf("ControlPath %q may exceed the unix socket path limit", a)
 	}
 }

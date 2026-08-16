@@ -319,10 +319,18 @@ func checkLocalRemote(label, root string) []result {
 // in syncengine, so we duplicate the small list here — keep the keepalive
 // options in sync with it.
 func sshDoctorArgs() []string {
+	// Mirror syncengine.sockDir: a per-user 0700 dir keeps the ControlMaster
+	// socket out of world-writable /tmp root, where another local user could
+	// pre-bind a predictable path and hijack the mux. Diagnostic probes are
+	// one-shot, so a pid-scoped socket name (no per-entry hash) is enough.
+	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
+	cp := filepath.Join(dir, fmt.Sprintf("dr-%d-%%r@%%h-%%p", os.Getpid()))
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", fmt.Sprintf("ControlPath=/tmp/caravan-ssh-%d-%%r@%%h-%%p", os.Getpid()),
+		"-o", "ControlPath=" + cp,
 		"-o", "ControlPersist=60s",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
@@ -333,6 +341,16 @@ func sshDoctorArgs() []string {
 // checkSSHRemote checks reachability and remote caravan version via SSH.
 func checkSSHRemote(label, host, root string) []result {
 	var out []result
+
+	// Fail closed if the ssh ControlMaster dir isn't a private 0700 dir we own —
+	// otherwise every probe below could route through another local user's mux.
+	if err := syncengine.EnsureSecureSockDir(); err != nil {
+		out = append(out, result{label, "ssh control-socket dir", statusFail, err.Error()})
+		for _, c := range []string{"remote reachable", "remote caravan version", "remote dir"} {
+			out = append(out, result{label, c, statusNA, "skipped (insecure control-socket dir)"})
+		}
+		return out
+	}
 
 	// 1. Reachability: ssh <host> true
 	reachArgs := append(sshDoctorArgs(), host, "true")
