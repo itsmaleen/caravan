@@ -95,11 +95,14 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
   (this change does it for the long-poll; extend to push/scan) and *exited* on
   repeated consecutive failures, `KeepAlive` would restart it — but the restart
   must **recycle the master first** (see below), or it re-hangs.
-- **[FIXED, 0.6.1] Reap a stale master at startup and after a timeout.**
-  `RemoteConn.closeMaster()` (`ssh -O exit`) now runs at the start of each watch
-  entry and whenever the long-poll times out, so a restart or retry can't inherit
-  a half-open master and re-hang. This is what `exec.CommandContext` alone could
-  not do — it kills the passenger ssh, not the persistent master.
+- **[FIXED, 0.6.1] Reap a stale master at startup.**
+  `RemoteConn.closeMaster()` (`ssh -O exit`) runs at the start of each watch entry,
+  so a restart can't inherit a half-open master and re-hang — something
+  `exec.CommandContext` alone could not do (it kills the passenger ssh, not the
+  persistent master). It is deliberately NOT run on a long-poll timeout: a
+  superseded WaitScan shares its entry's master with the sync that replaced it, so
+  tearing it down mid-transfer would abort that sync; keepalive (~45s) handles a
+  genuinely half-open master instead.
 - **[FIXED, #2] Private, per-process, per-entry `ControlPath`.** The socket lives
   at `/tmp/caravan-<uid>/s-<pid>-<sha256(entry-name)[:12]>-%r@%h-%p`, in a `0700`
   dir the user owns. `EnsureSecureSockDir` is **fail-closed** — called before any

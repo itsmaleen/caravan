@@ -276,7 +276,13 @@ func TestControlPathIsolation(t *testing.T) {
 	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Errorf("sockDir %q is not 0700 (err=%v)", dir, err)
 	}
-	if len(strings.ReplaceAll(a, "%", "")) > 104 {
-		t.Errorf("ControlPath %q may exceed the unix socket path limit", a)
+	// ssh expands %C to a fixed 40-char hash; the *expanded* path must fit the
+	// ~104-char unix-socket limit regardless of host/user length.
+	expanded := strings.ReplaceAll(a, "%C", strings.Repeat("x", 40))
+	if strings.ContainsRune(expanded, '%') {
+		t.Errorf("ControlPath %q still contains an unexpanded ssh token; use %%C", a)
+	}
+	if len(expanded) > 104 {
+		t.Errorf("expanded ControlPath %q (%d chars) exceeds the unix socket path limit", expanded, len(expanded))
 	}
 }
