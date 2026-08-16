@@ -326,7 +326,7 @@ func sshDoctorArgs() []string {
 	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
 	_ = os.MkdirAll(dir, 0o700)
 	_ = os.Chmod(dir, 0o700)
-	cp := filepath.Join(dir, fmt.Sprintf("dr-%d-%%r@%%h-%%p", os.Getpid()))
+	cp := filepath.Join(dir, fmt.Sprintf("dr-%d-%%C", os.Getpid()))
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
