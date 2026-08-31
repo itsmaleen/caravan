@@ -119,6 +119,36 @@ so the laptop is a clean source *pulling* sidecars down each cycle, never a
 producer. Related gap restated: **caravan has no log rotation**, which is what
 turns this from noise into a disk-space incident.
 
+**Bulk clean applied 2026-08-30 — hub only, loop dead.** Remedy (1) run on the
+mini: **3,113 sidecars removed** (`wrinkles` 2586→0, `agent-config` 527→0) with
+real-file counts unchanged (2789→2789, 543→543) as the integrity guard. Deletion
+was content-guarded, not a blanket `-name '._*' -delete`: each candidate had to
+be valid AppleDouble (`00051607`) **or** all-zero, else skipped and reported.
+Nothing was skipped. Passes went from `pulled 2586` to `pulled 0` with zero log
+growth; a round-trip test (create → 5 s to hub, delete → `deleted 0 local/3
+remote`) confirms sync is healthy.
+
+**New evidence on the origin.** 18 of the 3,113 (11 `wrinkles`, 7
+`agent-config`) were **163 bytes of pure zeros** — correct sidecar size, no
+AppleDouble header, not one non-zero byte. That is an allocation without a
+completed write, not a macOS xattr flush. Also, the origin **did not reproduce**
+on the cleaned tree: neither a plain file nor one carrying
+`com.apple.provenance` + `kMDItemWhereFroms` minted a sidecar on sync. Both
+strengthen the one-time-event hypothesis.
+
+**Gotcha — stale remote entry list after a hub-side clean.** Every pass failed
+`errors 1` (`tar: ._…: Cannot stat` → `pull: ssh pull: exit status 1`) while the
+mini's own fresh scan already reported **0** sidecars: the spoke had cached the
+pre-clean listing and did not self-heal. Fix is a daemon restart *with* mux
+recycle (`pkill -f "ControlPath=…/s-<pid>-"; rm -f …; launchctl kickstart -k`).
+A pull referencing entries absent on the remote arguably ought to invalidate the
+cached scan rather than error every cycle.
+
+**Not done: `framework` was offline** (last seen ~3 h prior) and still holds
+~2,585 + ~522 sidecars. As a spoke into the same hub it **will re-infect the mini
+on reconnect**. Clean it before adding `._*` to excludes — an excluded file is
+one caravan will never delete. Contained on the hub, **not resolved**.
+
 ---
 
 ## 2026-08-13 — the watch loop hangs for hours after the Mac sleeps
