@@ -8,7 +8,7 @@ Status legend: **[FIXED]** shipped · **[OPEN]** not yet addressed · **[IDEA]**
 
 ---
 
-## 2026-08-22 — AppleDouble `._*` files accumulate on receivers and spread [OPEN]
+## 2026-08-22 — AppleDouble `._*` files accumulate on receivers and spread [MITIGATED 2026-10-01]
 
 **Tracked as [#5](https://github.com/itsmaleen/caravan/issues/5).**
 
@@ -148,6 +148,36 @@ cached scan rather than error every cycle.
 ~2,585 + ~522 sidecars. As a spoke into the same hub it **will re-infect the mini
 on reconnect**. Clean it before adding `._*` to excludes — an excluded file is
 one caravan will never delete. Contained on the hub, **not resolved**.
+
+**Update 2026-10-01 — loop back, mechanism pinned down, default exclude added.**
+The hub had refilled to **690** sidecars in `wrinkles` (646 valid AppleDouble,
+44 starting with zero bytes) and **24** in `agent-config`, and `wrinkles.log`
+was back to **514 MB** with every pass reading `pulled 690`.
+
+*Why a pull can never land* (more precise than "absorbed on extract" above):
+the hub's bsdtar **never puts a `._X` member in the archive at all**. On the
+mini, `printf 'output/._index.html\n' > l; tar -cf - -T l | tar -tvf -` lists
+**nothing** and exits **0**; on the laptop, an archive built from both `._X` and
+`X` lists only `X`, even with `COPYFILE_DISABLE=1`. So `pullSSH` asks for 690
+paths, receives an empty stream, reports success, and the next scan plans the
+same 690 pulls again. Neither side errors, which is why it is silent.
+
+*Origin, still open.* Sidecar mtimes equal their base file's mtime, and both
+mtimes and birth times run 2026-08-23 → 2026-09-11, after the Aug 30 clean.
+Neither proves when the files were created on the hub, because libarchive
+restores both on extract. `framework` (holding its own uncleaned copies) was
+last online ~2026-09-14, which fits the predicted re-infection, but this is
+consistent with it rather than proven.
+
+*Remedy.* `._*` is now in `DefaultExcludes` (with
+`TestAppleDouble_ExcludedFromScan`, which fails without it). This fixes the
+problem whatever the origin: an excluded path is never scanned on either side,
+so it is never planned, pulled or spread. The cost is the one already noted:
+caravan will never delete existing sidecars, so clean them once by hand (done
+on the hub 2026-10-01 with the same content-guarded delete, 714 removed,
+real-file counts unchanged). Until a spoke runs a binary with the new default,
+its manifest needs `exclude = ["._*"]` per entry; the MacBook has that now.
+`framework` still has neither the exclude nor a clean.
 
 ---
 
