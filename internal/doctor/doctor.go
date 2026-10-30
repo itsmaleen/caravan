@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -30,9 +31,15 @@ import (
 // Tests set this to a t.TempDir().
 var StateDirOverride = ""
 
-// LaunchAgentsDirOverride, when non-empty, replaces ~/Library/LaunchAgents as
-// the directory where daemon plist files are checked.
+// DaemonUnitDirOverride, when non-empty, replaces the platform's service
+// directory as the place where daemon unit files are checked:
+// ~/Library/LaunchAgents on macOS, ~/.config/systemd/user on Linux.
 // Tests set this to a t.TempDir().
+var DaemonUnitDirOverride = ""
+
+// LaunchAgentsDirOverride is the macOS-only name DaemonUnitDirOverride grew out
+// of, kept so existing callers keep working.
+// Deprecated: set DaemonUnitDirOverride instead.
 var LaunchAgentsDirOverride = ""
 
 // runCmd is the exec hook: tests replace this to avoid real subprocess calls.
@@ -288,8 +295,8 @@ func checksForSyncEntry(s manifest.Sync) []result {
 	// conflicts dir
 	out = append(out, checkConflicts(label, s.Name))
 
-	// daemon plist
-	out = append(out, checkDaemonPlist(label, s.Name))
+	// daemon unit (launchd plist / systemd user unit)
+	out = append(out, checkDaemonUnit(label, s.Name))
 
 	return out
 }
@@ -506,30 +513,48 @@ func checkConflicts(label, name string) result {
 	return result{label, "conflicts", statusOK, detail}
 }
 
-// ── daemon plist check ────────────────────────────────────────────────────────
+// ── daemon unit check ─────────────────────────────────────────────────────────
 
-func daemonPlistPath(name string) string {
-	laDir := LaunchAgentsDirOverride
-	if laDir == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			laDir = "LaunchAgents"
-		} else {
-			laDir = filepath.Join(h, "Library", "LaunchAgents")
-		}
+// daemonUnitDir returns the directory the platform's service manager reads
+// user services from.
+func daemonUnitDir() string {
+	if DaemonUnitDirOverride != "" {
+		return DaemonUnitDirOverride
 	}
-	label := "dev.caravan.sync." + name
-	return filepath.Join(laDir, label+".plist")
+	if LaunchAgentsDirOverride != "" {
+		return LaunchAgentsDirOverride
+	}
+	h, err := os.UserHomeDir()
+	if err != nil {
+		h = "."
+	}
+	if runtime.GOOS == "linux" {
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			return filepath.Join(xdg, "systemd", "user")
+		}
+		return filepath.Join(h, ".config", "systemd", "user")
+	}
+	return filepath.Join(h, "Library", "LaunchAgents")
 }
 
-func checkDaemonPlist(label, name string) result {
-	path := daemonPlistPath(name)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return result{label, "daemon plist", statusNA, "not installed"}
-	} else if err != nil {
-		return result{label, "daemon plist", statusNA, "cannot check: " + err.Error()}
+// daemonUnitPath returns the service definition file caravan would install for
+// a sync entry. The two managers name their files differently, so this has to
+// agree with internal/syncengine's supervisors.
+func daemonUnitPath(name string) string {
+	if runtime.GOOS == "linux" {
+		return filepath.Join(daemonUnitDir(), "caravan-sync-"+name+".service")
 	}
-	return result{label, "daemon plist", statusOK, "installed (" + path + ")"}
+	return filepath.Join(daemonUnitDir(), "dev.caravan.sync."+name+".plist")
+}
+
+func checkDaemonUnit(label, name string) result {
+	path := daemonUnitPath(name)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return result{label, "daemon unit", statusNA, "not installed"}
+	} else if err != nil {
+		return result{label, "daemon unit", statusNA, "cannot check: " + err.Error()}
+	}
+	return result{label, "daemon unit", statusOK, "installed (" + path + ")"}
 }
 
 // ── secrets checks ────────────────────────────────────────────────────────────

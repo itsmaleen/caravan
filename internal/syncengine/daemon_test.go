@@ -123,8 +123,11 @@ func setupDaemonTest(t *testing.T) (laDir string, stateDir string, calls *[][]st
 
 	origLA := LaunchAgentsDir
 	origSD := StateDir
+	origBackend := DaemonBackend
 	LaunchAgentsDir = laDir
 	StateDir = stateDir
+	// Pin the backend so these stay launchd tests when run on Linux.
+	DaemonBackend = "launchd"
 
 	recorded := [][]string{}
 	calls = &recorded
@@ -140,6 +143,7 @@ func setupDaemonTest(t *testing.T) (laDir string, stateDir string, calls *[][]st
 	t.Cleanup(func() {
 		LaunchAgentsDir = origLA
 		StateDir = origSD
+		DaemonBackend = origBackend
 		launchctlRun = origLaunchctl
 	})
 
