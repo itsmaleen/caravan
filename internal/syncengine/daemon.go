@@ -38,8 +38,8 @@ var launchctlRun = func(args ...string) ([]byte, error) {
 
 // CmdDaemon implements `caravan daemon <install|uninstall|status> [NAME] [flags]`.
 func CmdDaemon(args []string) int {
-	if runtime.GOOS != "darwin" {
-		fmt.Fprintln(os.Stderr, "daemon: only supported on macOS")
+	if _, err := activeSupervisor(); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 		return 1
 	}
 
@@ -115,14 +115,17 @@ func cmdDaemonInstall(args []string) int {
 		return 1
 	}
 
-	laDir := resolvedLaunchAgentsDir()
-	uid := os.Getuid()
+	sup, err := activeSupervisor()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon install: %v\n", err)
+		return 1
+	}
 	code := 0
 
 	for _, s := range entries {
-		label := daemonLabel(s.Name)
-		plistPath := filepath.Join(laDir, label+".plist")
-		logPath := daemonLogPath(s.Name)
+		label := sup.Label(s.Name)
+		unitPath := sup.UnitPath(s.Name)
+		logPath := sup.LogPath(s.Name)
 
 		// Ensure log directory exists.
 		if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
@@ -131,42 +134,37 @@ func cmdDaemonInstall(args []string) int {
 			continue
 		}
 
-		// If already installed, boot it out first (upgrade path).
-		if _, statErr := os.Stat(plistPath); statErr == nil {
-			_, _ = launchctlRun("bootout", fmt.Sprintf("gui/%d/%s", uid, label))
+		// If already installed, stop it first (upgrade path) so the running
+		// process is not left pinned to the old unit definition.
+		if _, statErr := os.Stat(unitPath); statErr == nil {
+			_ = sup.Stop(s.Name)
 		}
 
-		// Write plist.
-		plist := launchdPlist(label, binPath, absMpath, s.Name, *intervalFlag, logPath)
-		if err := os.MkdirAll(laDir, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "daemon install %s: mkdir LaunchAgents: %v\n", s.Name, err)
+		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon install %s: mkdir %s: %v\n", s.Name, filepath.Dir(unitPath), err)
 			code = 1
 			continue
 		}
-		if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
-			fmt.Fprintf(os.Stderr, "daemon install %s: write plist: %v\n", s.Name, err)
+		unit := sup.Render(s.Name, binPath, absMpath, *intervalFlag, logPath)
+		if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon install %s: write %s: %v\n", s.Name, sup.UnitKind(), err)
 			code = 1
 			continue
 		}
 
-		// Bootstrap (preferred on macOS 10.11+).
-		out, bootstrapErr := launchctlRun("bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
-		if bootstrapErr != nil {
-			outStr := string(out)
-			// If already loaded (not a "Bootstrap failed" from a different cause), skip.
-			if strings.Contains(outStr, "already") || strings.Contains(outStr, "Bootstrap failed") {
-				// Treat as success — already running.
-				fmt.Printf("daemon: %s already loaded\n", label)
-			} else {
-				// Fall back to legacy load.
-				if _, loadErr := launchctlRun("load", plistPath); loadErr != nil {
-					fmt.Fprintf(os.Stderr, "daemon install %s: launchctl load: %v\n", s.Name, loadErr)
-					code = 1
-					continue
-				}
-			}
+		// systemd needs the new unit file read back before it can be enabled;
+		// launchd has no equivalent step and no-ops here.
+		if err := sup.Reload(); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon install %s: %v\n", s.Name, err)
+			code = 1
+			continue
 		}
-		fmt.Printf("daemon: installed %s → %s\n", label, plistPath)
+		if err := sup.Start(s.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon install %s: %v\n", s.Name, err)
+			code = 1
+			continue
+		}
+		fmt.Printf("daemon: installed %s → %s\n", label, unitPath)
 	}
 	return code
 }
@@ -204,23 +202,26 @@ func cmdDaemonUninstall(args []string) int {
 		return 1
 	}
 
-	laDir := resolvedLaunchAgentsDir()
-	uid := os.Getuid()
+	sup, err := activeSupervisor()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon uninstall: %v\n", err)
+		return 1
+	}
 	code := 0
 
 	for _, s := range entries {
-		label := daemonLabel(s.Name)
-		plistPath := filepath.Join(laDir, label+".plist")
+		label := sup.Label(s.Name)
+		unitPath := sup.UnitPath(s.Name)
 
-		// bootout (ignore errors — may already be stopped).
-		_, _ = launchctlRun("bootout", fmt.Sprintf("gui/%d/%s", uid, label))
+		// Stop first — ignore errors, it may already be stopped.
+		_ = sup.Stop(s.Name)
 
-		// Remove plist.
-		if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "daemon uninstall %s: remove plist: %v\n", s.Name, err)
+		if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "daemon uninstall %s: remove %s: %v\n", s.Name, sup.UnitKind(), err)
 			code = 1
 			continue
 		}
+		_ = sup.Reload()
 		fmt.Printf("daemon: uninstalled %s\n", label)
 	}
 	return code
@@ -259,59 +260,43 @@ func cmdDaemonStatus(args []string) int {
 		return 1
 	}
 
-	laDir := resolvedLaunchAgentsDir()
-	uid := os.Getuid()
+	sup, err := activeSupervisor()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon status: %v\n", err)
+		return 1
+	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "  NAME\tPLIST\tRUNNING\tPID\tLAST SYNC")
+	fmt.Fprintf(w, "  NAME\t%s\tRUNNING\tPID\tLAST SYNC\n", strings.ToUpper(sup.UnitKind()))
 
 	for _, s := range entries {
-		label := daemonLabel(s.Name)
-		plistPath := filepath.Join(laDir, label+".plist")
+		unitPath := sup.UnitPath(s.Name)
 
-		plistPresent := "✗"
-		if _, err := os.Stat(plistPath); err == nil {
-			plistPresent = "✓"
+		unitPresent := "✗"
+		if _, err := os.Stat(unitPath); err == nil {
+			unitPresent = "✓"
 		}
 
-		running := "-"
+		running := "✗"
 		pid := "-"
-		out, err := launchctlRun("print", fmt.Sprintf("gui/%d/%s", uid, label))
-		if err == nil {
-			outStr := string(out)
-			// Parse "pid = <num>" from launchctl print output.
-			for _, line := range strings.Split(outStr, "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "pid = ") {
-					pidStr := strings.TrimPrefix(line, "pid = ")
-					if _, parseErr := strconv.Atoi(strings.TrimSpace(pidStr)); parseErr == nil {
-						pid = strings.TrimSpace(pidStr)
-						running = "✓"
-					}
-				}
-				// Also accept "state = running"
-				if strings.Contains(line, "state = running") {
-					running = "✓"
-				}
+		if isRunning, gotPID := sup.Probe(s.Name); isRunning {
+			running = "✓"
+			if gotPID != "" {
+				pid = gotPID
 			}
-			if running == "-" {
-				running = "✗"
-			}
-		} else {
-			running = "✗"
 		}
 
 		lastSync := daemonReadLastSync(s.Name)
 
 		glyph := "~"
-		if plistPresent == "✓" && running == "✓" {
+		if unitPresent == "✓" && running == "✓" {
 			glyph = "✓"
-		} else if plistPresent == "✗" {
+		} else if unitPresent == "✗" {
 			glyph = "✗"
 		}
 
 		fmt.Fprintf(w, "%s %s\t%s\t%s\t%s\t%s\n",
-			glyph, s.Name, plistPresent, running, pid, lastSync)
+			glyph, s.Name, unitPresent, running, pid, lastSync)
 	}
 	w.Flush()
 	return 0
@@ -427,4 +412,130 @@ func filterEntries(entries []manifest.Sync, nameFilter string) []manifest.Sync {
 		}
 	}
 	return nil
+}
+
+// ── supervisor abstraction ────────────────────────────────────────────────────
+
+// supervisor is the platform's service manager. launchd on macOS, systemd
+// --user on Linux. Everything in the three daemon sub-commands that differs
+// between platforms lives behind this interface, so the command flow itself is
+// written once.
+type supervisor interface {
+	// Label is the service identifier as the platform knows it — the launchd
+	// label, or the systemd unit name.
+	Label(entry string) string
+	// UnitPath is the absolute path of the file that defines the service.
+	UnitPath(entry string) string
+	// UnitKind names that file for humans: "plist" or "unit".
+	UnitKind() string
+	// LogPath is where the service's stdout+stderr are appended.
+	LogPath(entry string) string
+	// Render returns the complete text of the service definition file.
+	Render(entry, binPath, manifestPath, interval, logPath string) string
+	// Reload makes the service manager re-read on-disk definitions. No-op
+	// where the manager reads the file at load time (launchd).
+	Reload() error
+	// Start loads and runs the service, enabling it across reboots.
+	Start(entry string) error
+	// Stop unloads the service and disables it across reboots.
+	Stop(entry string) error
+	// Probe reports whether the service is running, and its PID when known.
+	Probe(entry string) (running bool, pid string)
+}
+
+// DaemonBackend forces a supervisor: "launchd" or "systemd". Empty means pick
+// from runtime.GOOS. Tests set this so both backends are exercised on either
+// platform.
+var DaemonBackend = ""
+
+// activeSupervisor returns the supervisor for this machine, or an error naming
+// the unsupported platform.
+func activeSupervisor() (supervisor, error) {
+	backend := DaemonBackend
+	if backend == "" {
+		switch runtime.GOOS {
+		case "darwin":
+			backend = "launchd"
+		case "linux":
+			backend = "systemd"
+		default:
+			return nil, fmt.Errorf("no service manager for %s (supported: macOS/launchd, Linux/systemd)", runtime.GOOS)
+		}
+	}
+	switch backend {
+	case "launchd":
+		return launchdSupervisor{}, nil
+	case "systemd":
+		return systemdSupervisor{}, nil
+	default:
+		return nil, fmt.Errorf("unknown daemon backend %q (want launchd or systemd)", backend)
+	}
+}
+
+// ── launchd supervisor ────────────────────────────────────────────────────────
+
+type launchdSupervisor struct{}
+
+func (launchdSupervisor) Label(entry string) string { return daemonLabel(entry) }
+
+func (l launchdSupervisor) UnitPath(entry string) string {
+	return filepath.Join(resolvedLaunchAgentsDir(), l.Label(entry)+".plist")
+}
+
+func (launchdSupervisor) UnitKind() string { return "plist" }
+
+func (launchdSupervisor) LogPath(entry string) string { return daemonLogPath(entry) }
+
+func (l launchdSupervisor) Render(entry, binPath, manifestPath, interval, logPath string) string {
+	return launchdPlist(l.Label(entry), binPath, manifestPath, entry, interval, logPath)
+}
+
+// Reload is a no-op: launchd reads the plist when the job is bootstrapped.
+func (launchdSupervisor) Reload() error { return nil }
+
+func (l launchdSupervisor) Start(entry string) error {
+	plistPath := l.UnitPath(entry)
+	out, err := launchctlRun("bootstrap", fmt.Sprintf("gui/%d", os.Getuid()), plistPath)
+	if err == nil {
+		return nil
+	}
+	outStr := string(out)
+	// "already loaded" is success — the job is running, which is the goal.
+	if strings.Contains(outStr, "already") || strings.Contains(outStr, "Bootstrap failed") {
+		fmt.Printf("daemon: %s already loaded\n", l.Label(entry))
+		return nil
+	}
+	// Fall back to the legacy loader for older macOS.
+	if _, loadErr := launchctlRun("load", plistPath); loadErr != nil {
+		return fmt.Errorf("launchctl load: %w", loadErr)
+	}
+	return nil
+}
+
+func (l launchdSupervisor) Stop(entry string) error {
+	_, err := launchctlRun("bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), l.Label(entry)))
+	return err
+}
+
+func (l launchdSupervisor) Probe(entry string) (bool, string) {
+	out, err := launchctlRun("print", fmt.Sprintf("gui/%d/%s", os.Getuid(), l.Label(entry)))
+	if err != nil {
+		return false, ""
+	}
+	running := false
+	pid := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "pid = ") {
+			pidStr := strings.TrimSpace(strings.TrimPrefix(line, "pid = "))
+			if _, parseErr := strconv.Atoi(pidStr); parseErr == nil {
+				pid = pidStr
+				running = true
+			}
+		}
+		if strings.Contains(line, "state = running") {
+			running = true
+		}
+	}
+	return running, pid
 }
