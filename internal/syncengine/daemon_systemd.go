@@ -82,21 +82,26 @@ func (s systemdSupervisor) Stop(entry string) error {
 }
 
 func (s systemdSupervisor) Probe(entry string) (bool, string) {
-	out, err := systemctlRun("show", s.Label(entry), "-p", "ActiveState", "-p", "MainPID", "--value")
+	out, err := systemctlRun("show", s.Label(entry), "-p", "ActiveState", "-p", "MainPID")
 	if err != nil {
 		return false, ""
 	}
-	// `--value` prints one value per line, in the order the -p flags were
-	// given: ActiveState then MainPID.
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 0 {
-		return false, ""
-	}
-	running := strings.TrimSpace(lines[0]) == "active"
-	pid := ""
-	if len(lines) > 1 {
-		if p := strings.TrimSpace(lines[1]); p != "" && p != "0" {
-			pid = p
+	// Parse KEY=value lines by name: systemctl prints properties in D-Bus
+	// order, not -p order (systemd 245 prints MainPID first), so `--value`
+	// output cannot be read positionally.
+	running, pid := false, ""
+	for _, line := range strings.Split(string(out), "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "ActiveState":
+			running = val == "active"
+		case "MainPID":
+			if val != "" && val != "0" {
+				pid = val
+			}
 		}
 	}
 	return running, pid
@@ -143,10 +148,11 @@ WantedBy=default.target
 }
 
 // systemdQuote renders one ExecStart argument. systemd splits on whitespace
-// unless the argument is double-quoted, and expands %-specifiers everywhere,
-// so both need handling before a path with a space or a percent reaches it.
+// unless the argument is double-quoted, expands %-specifiers everywhere, and
+// expands $VAR in ExecStart even inside quotes, so all three need handling
+// before a path with a space, a percent or a dollar sign reaches it.
 func systemdQuote(arg string) string {
-	escaped := systemdEscape(arg)
+	escaped := strings.ReplaceAll(systemdEscape(arg), "$", "$$")
 	if arg == "" {
 		return `""`
 	}

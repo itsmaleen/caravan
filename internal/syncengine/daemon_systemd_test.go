@@ -320,13 +320,14 @@ func TestSystemdDaemon_Uninstall_RemovesUnit(t *testing.T) {
 func TestSystemdDaemon_Status_Probes(t *testing.T) {
 	unitDir, calls := setupSystemdTest(t)
 
-	// Override the stub to return a realistic `systemctl show --value` reply.
+	// Override the stub with real systemd 245 output: MainPID comes first even
+	// though ActiveState is asked for first.
 	systemctlRun = func(args ...string) ([]byte, error) {
 		cp := make([]string, len(args))
 		copy(cp, args)
 		*calls = append(*calls, cp)
 		if len(args) > 0 && args[0] == "show" {
-			return []byte("active\n4242\n"), nil
+			return []byte("MainPID=4242\nActiveState=active\n"), nil
 		}
 		return []byte(""), nil
 	}
@@ -361,7 +362,7 @@ func TestSystemdProbe_InactiveAndZeroPID(t *testing.T) {
 	_, _ = setupSystemdTest(t)
 
 	systemctlRun = func(args ...string) ([]byte, error) {
-		return []byte("inactive\n0\n"), nil
+		return []byte("MainPID=0\nActiveState=inactive\n"), nil
 	}
 
 	running, pid := systemdSupervisor{}.Probe("work")

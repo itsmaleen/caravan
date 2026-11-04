@@ -69,6 +69,64 @@ const daemonUsage = `Usage:
   caravan daemon uninstall [NAME] [-f MANIFEST]
   caravan daemon status [NAME] [-f MANIFEST]`
 
+// validDaemonName reports whether a sync entry name is safe to use in a
+// service label and a file path. Entry names are otherwise free-form, but
+// systemd rejects spaces and most punctuation in unit names, and a "/" or ".."
+// would put the unit or log file outside its directory.
+func validDaemonName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("sync entry name %q cannot be used for a daemon", name)
+	}
+	for _, r := range name {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.'
+		if !ok {
+			return fmt.Errorf("sync entry name %q cannot be used for a daemon: use only letters, digits, '-', '_' and '.'", name)
+		}
+	}
+	return nil
+}
+
+// stopForChange stops an installed daemon before its definition is replaced
+// or removed. A failed stop is fine when the service is not running anyway
+// (never loaded, already stopped); otherwise the caller must not go on, or the
+// old process keeps running with nothing on disk describing it.
+func stopForChange(sup supervisor, entry string) error {
+	err := sup.Stop(entry)
+	if err == nil {
+		return nil
+	}
+	if running, _ := sup.Probe(entry); running {
+		return err
+	}
+	return nil
+}
+
+// writeFileAtomic writes data to a temporary file beside path and renames it
+// into place, so a full disk or an interrupted write never leaves a truncated
+// unit behind.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
 // ── install ───────────────────────────────────────────────────────────────────
 
 func cmdDaemonInstall(args []string) int {
@@ -109,6 +167,13 @@ func cmdDaemonInstall(args []string) int {
 		return 1
 	}
 
+	// The interval is written into the service definition verbatim, so check
+	// it parses the way `sync --interval` will parse it.
+	if d, err := time.ParseDuration(*intervalFlag); err != nil || d <= 0 {
+		fmt.Fprintf(os.Stderr, "daemon install: invalid --interval %q (want a duration such as 5s or 1m)\n", *intervalFlag)
+		return 2
+	}
+
 	binPath, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "daemon install: cannot determine executable path: %v\n", err)
@@ -123,6 +188,11 @@ func cmdDaemonInstall(args []string) int {
 	code := 0
 
 	for _, s := range entries {
+		if err := validDaemonName(s.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon install: %v\n", err)
+			code = 1
+			continue
+		}
 		label := sup.Label(s.Name)
 		unitPath := sup.UnitPath(s.Name)
 		logPath := sup.LogPath(s.Name)
@@ -135,9 +205,17 @@ func cmdDaemonInstall(args []string) int {
 		}
 
 		// If already installed, stop it first (upgrade path) so the running
-		// process is not left pinned to the old unit definition.
+		// process is not left pinned to the old unit definition. Starting an
+		// already-running service does not restart it, so a stop that failed
+		// with the service still up would make the upgrade a silent no-op.
+		installed := false
 		if _, statErr := os.Stat(unitPath); statErr == nil {
-			_ = sup.Stop(s.Name)
+			installed = true
+			if err := stopForChange(sup, s.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "daemon install %s: could not stop the running daemon: %v\n", s.Name, err)
+				code = 1
+				continue
+			}
 		}
 
 		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
@@ -146,8 +224,12 @@ func cmdDaemonInstall(args []string) int {
 			continue
 		}
 		unit := sup.Render(s.Name, binPath, absMpath, *intervalFlag, logPath)
-		if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		if err := writeFileAtomic(unitPath, []byte(unit), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "daemon install %s: write %s: %v\n", s.Name, sup.UnitKind(), err)
+			if installed {
+				// The old definition is untouched; bring the old daemon back.
+				_ = sup.Start(s.Name)
+			}
 			code = 1
 			continue
 		}
@@ -210,18 +292,32 @@ func cmdDaemonUninstall(args []string) int {
 	code := 0
 
 	for _, s := range entries {
+		if err := validDaemonName(s.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon uninstall: %v\n", err)
+			code = 1
+			continue
+		}
 		label := sup.Label(s.Name)
 		unitPath := sup.UnitPath(s.Name)
 
-		// Stop first — ignore errors, it may already be stopped.
-		_ = sup.Stop(s.Name)
+		// Stop first. A failure is fine when it was not running anyway, but
+		// removing the definition of a daemon that is still running would
+		// leave a sync going that nothing can manage.
+		if err := stopForChange(sup, s.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon uninstall %s: could not stop the running daemon, leaving it installed: %v\n", s.Name, err)
+			code = 1
+			continue
+		}
 
 		if err := os.Remove(unitPath); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "daemon uninstall %s: remove %s: %v\n", s.Name, sup.UnitKind(), err)
 			code = 1
 			continue
 		}
-		_ = sup.Reload()
+		if err := sup.Reload(); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon uninstall %s: %v\n", s.Name, err)
+			code = 1
+		}
 		fmt.Printf("daemon: uninstalled %s\n", label)
 	}
 	return code
