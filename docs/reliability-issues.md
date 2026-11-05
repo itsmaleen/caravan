@@ -104,8 +104,9 @@ on *any* mismatch including a downgrade — fine, but the warm-up matters there 
   tearing it down mid-transfer would abort that sync; keepalive (~45s) handles a
   genuinely half-open master instead.
 - **[FIXED, #2] Private, per-process, per-entry `ControlPath`.** The socket lives
-  at `/tmp/caravan-<uid>/s-<pid>-<sha256(entry-name)[:12]>-%r@%h-%p`, in a `0700`
-  dir the user owns. `EnsureSecureSockDir` is **fail-closed** — called before any
+  at `/tmp/caravan-<uid>/s-<pid>-<sha256(entry-name)[:16]>-%C`, in a `0700`
+  dir the user owns. `%C` is ssh's fixed 40-char connection hash, so the
+  expanded path stays under the unix-socket limit whatever the host or user. `EnsureSecureSockDir` is **fail-closed** — called before any
   ssh op in both one-shot and watch sync (and in `doctor`), it refuses to proceed
   if the dir isn't a private directory we own at 0700. This (a) closes the
   world-writable-`/tmp` mux-hijack (the socket speaks an unauthenticated protocol,
