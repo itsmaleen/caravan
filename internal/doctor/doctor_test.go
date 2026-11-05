@@ -382,33 +382,38 @@ func TestCheckConflictsWithFiles(t *testing.T) {
 	}
 }
 
-// ── daemon plist checks ───────────────────────────────────────────────────────
+// ── daemon unit checks ────────────────────────────────────────────────────────
 
-func TestCheckDaemonPlistNotInstalled(t *testing.T) {
+func TestCheckDaemonUnitNotInstalled(t *testing.T) {
 	dir := t.TempDir()
-	LaunchAgentsDirOverride = dir
-	t.Cleanup(func() { LaunchAgentsDirOverride = "" })
+	DaemonUnitDirOverride = dir
+	t.Cleanup(func() { DaemonUnitDirOverride = "" })
 
-	r := checkDaemonPlist("sync/foo", "foo")
+	r := checkDaemonUnit("sync/foo", "foo")
 	if r.status != statusNA {
-		t.Errorf("expected - for missing plist, got %q", r.status)
+		t.Errorf("expected - for missing unit, got %q", r.status)
 	}
 	if !strings.Contains(r.detail, "not installed") {
 		t.Errorf("expected 'not installed' in detail, got %q", r.detail)
 	}
 }
 
-func TestCheckDaemonPlistInstalled(t *testing.T) {
+func TestCheckDaemonUnitInstalled(t *testing.T) {
 	dir := t.TempDir()
-	LaunchAgentsDirOverride = dir
-	t.Cleanup(func() { LaunchAgentsDirOverride = "" })
+	DaemonUnitDirOverride = dir
+	t.Cleanup(func() { DaemonUnitDirOverride = "" })
 
-	plistPath := filepath.Join(dir, "dev.caravan.sync.foo.plist")
-	if err := os.WriteFile(plistPath, []byte("<plist/>"), 0o644); err != nil {
+	// Ask the code under test where it expects the file, so this test asserts
+	// the same thing on macOS (plist) and Linux (systemd unit).
+	unitPath := daemonUnitPath("foo")
+	if filepath.Dir(unitPath) != dir {
+		t.Fatalf("daemonUnitPath ignored the override: %s", unitPath)
+	}
+	if err := os.WriteFile(unitPath, []byte("unit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	r := checkDaemonPlist("sync/foo", "foo")
+	r := checkDaemonUnit("sync/foo", "foo")
 	if r.status != statusOK {
 		t.Errorf("expected ✓ for installed plist, got %q (detail: %s)", r.status, r.detail)
 	}
@@ -587,7 +592,7 @@ func TestSampleRenderedOutput(t *testing.T) {
 		{"sync/work", "state file", statusOK, "last sync 5m0s ago"},
 		{"sync/work", "lock", statusOK, "free"},
 		{"sync/work", "conflicts", statusOK, "0 backups"},
-		{"sync/work", "daemon plist", statusNA, "not installed"},
+		{"sync/work", "daemon unit", statusNA, "not installed"},
 		{"secrets", "machine key", statusOK, "/home/user/.config/caravan/age.key"},
 		{"secrets", "store file", statusOK, "/home/user/.config/caravan/secrets.enc.json (1 recipient(s), 2 repo(s))"},
 	}
@@ -610,4 +615,21 @@ func localCaravanVersion() string {
 		}
 	}
 	return ""
+}
+
+// TestSSHDoctorArgsKeepalive keeps the diagnostic ssh options in lockstep with
+// syncengine's sshBaseArgs (keepalive + pid-scoped ControlPath), guarding the
+// intentional shorter ConnectTimeout used only for doctor probes.
+func TestSSHDoctorArgsKeepalive(t *testing.T) {
+	args := strings.Join(sshDoctorArgs(), " ")
+	for _, want := range []string{
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
+		"ConnectTimeout=5",
+		fmt.Sprintf("ControlPath=/tmp/caravan-%d/dr-%d-%%C", os.Getuid(), os.Getpid()),
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("sshDoctorArgs() missing %q\n  got: %s", want, args)
+		}
+	}
 }

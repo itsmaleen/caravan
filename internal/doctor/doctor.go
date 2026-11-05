@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -30,9 +31,15 @@ import (
 // Tests set this to a t.TempDir().
 var StateDirOverride = ""
 
-// LaunchAgentsDirOverride, when non-empty, replaces ~/Library/LaunchAgents as
-// the directory where daemon plist files are checked.
+// DaemonUnitDirOverride, when non-empty, replaces the platform's service
+// directory as the place where daemon unit files are checked:
+// ~/Library/LaunchAgents on macOS, ~/.config/systemd/user on Linux.
 // Tests set this to a t.TempDir().
+var DaemonUnitDirOverride = ""
+
+// LaunchAgentsDirOverride is the macOS-only name DaemonUnitDirOverride grew out
+// of, kept so existing callers keep working.
+// Deprecated: set DaemonUnitDirOverride instead.
 var LaunchAgentsDirOverride = ""
 
 // runCmd is the exec hook: tests replace this to avoid real subprocess calls.
@@ -293,8 +300,8 @@ func checksForSyncEntry(s manifest.Sync) []result {
 	// conflicts dir
 	out = append(out, checkConflicts(label, s.Name))
 
-	// daemon plist
-	out = append(out, checkDaemonPlist(label, s.Name))
+	// daemon unit (launchd plist / systemd user unit)
+	out = append(out, checkDaemonUnit(label, s.Name))
 
 	return out
 }
@@ -320,14 +327,25 @@ func checkLocalRemote(label, root string) []result {
 }
 
 // sshDoctorArgs mirrors the options from syncengine/remote.go sshBaseArgs()
-// with an extra ConnectTimeout for diagnostic use. sshBaseArgs is unexported
-// in syncengine, so we duplicate the small list here.
+// with a shorter ConnectTimeout for diagnostic use. sshBaseArgs is unexported
+// in syncengine, so we duplicate the small list here — keep the keepalive
+// options in sync with it.
 func sshDoctorArgs() []string {
+	// Mirror syncengine.sockDir: a per-user 0700 dir keeps the ControlMaster
+	// socket out of world-writable /tmp root, where another local user could
+	// pre-bind a predictable path and hijack the mux. Diagnostic probes are
+	// one-shot, so a pid-scoped socket name (no per-entry hash) is enough.
+	dir := filepath.Join("/tmp", fmt.Sprintf("caravan-%d", os.Getuid()))
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.Chmod(dir, 0o700)
+	cp := filepath.Join(dir, fmt.Sprintf("dr-%d-%%C", os.Getpid()))
 	return []string{
 		"-o", "BatchMode=yes",
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/caravan-ssh-%r@%h-%p",
+		"-o", "ControlPath=" + cp,
 		"-o", "ControlPersist=60s",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=5",
 	}
 }
@@ -335,6 +353,16 @@ func sshDoctorArgs() []string {
 // checkSSHRemote checks reachability and remote caravan version via SSH.
 func checkSSHRemote(label, host, root string) []result {
 	var out []result
+
+	// Fail closed if the ssh ControlMaster dir isn't a private 0700 dir we own —
+	// otherwise every probe below could route through another local user's mux.
+	if err := syncengine.EnsureSecureSockDir(); err != nil {
+		out = append(out, result{label, "ssh control-socket dir", statusFail, err.Error()})
+		for _, c := range []string{"remote reachable", "remote caravan version", "remote dir"} {
+			out = append(out, result{label, c, statusNA, "skipped (insecure control-socket dir)"})
+		}
+		return out
+	}
 
 	// 1. Reachability: ssh <host> true
 	reachArgs := append(sshDoctorArgs(), host, "true")
@@ -490,30 +518,48 @@ func checkConflicts(label, name string) result {
 	return result{label, "conflicts", statusOK, detail}
 }
 
-// ── daemon plist check ────────────────────────────────────────────────────────
+// ── daemon unit check ─────────────────────────────────────────────────────────
 
-func daemonPlistPath(name string) string {
-	laDir := LaunchAgentsDirOverride
-	if laDir == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			laDir = "LaunchAgents"
-		} else {
-			laDir = filepath.Join(h, "Library", "LaunchAgents")
-		}
+// daemonUnitDir returns the directory the platform's service manager reads
+// user services from.
+func daemonUnitDir() string {
+	if DaemonUnitDirOverride != "" {
+		return DaemonUnitDirOverride
 	}
-	label := "dev.caravan.sync." + name
-	return filepath.Join(laDir, label+".plist")
+	if LaunchAgentsDirOverride != "" {
+		return LaunchAgentsDirOverride
+	}
+	h, err := os.UserHomeDir()
+	if err != nil {
+		h = "."
+	}
+	if runtime.GOOS == "linux" {
+		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+			return filepath.Join(xdg, "systemd", "user")
+		}
+		return filepath.Join(h, ".config", "systemd", "user")
+	}
+	return filepath.Join(h, "Library", "LaunchAgents")
 }
 
-func checkDaemonPlist(label, name string) result {
-	path := daemonPlistPath(name)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return result{label, "daemon plist", statusNA, "not installed"}
-	} else if err != nil {
-		return result{label, "daemon plist", statusNA, "cannot check: " + err.Error()}
+// daemonUnitPath returns the service definition file caravan would install for
+// a sync entry. The two managers name their files differently, so this has to
+// agree with internal/syncengine's supervisors.
+func daemonUnitPath(name string) string {
+	if runtime.GOOS == "linux" {
+		return filepath.Join(daemonUnitDir(), "caravan-sync-"+name+".service")
 	}
-	return result{label, "daemon plist", statusOK, "installed (" + path + ")"}
+	return filepath.Join(daemonUnitDir(), "dev.caravan.sync."+name+".plist")
+}
+
+func checkDaemonUnit(label, name string) result {
+	path := daemonUnitPath(name)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return result{label, "daemon unit", statusNA, "not installed"}
+	} else if err != nil {
+		return result{label, "daemon unit", statusNA, "cannot check: " + err.Error()}
+	}
+	return result{label, "daemon unit", statusOK, "installed (" + path + ")"}
 }
 
 // ── secrets checks ────────────────────────────────────────────────────────────

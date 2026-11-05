@@ -83,7 +83,7 @@ mise = true                # run `mise install` per repo when mise is on PATH
 name     = "notes"
 local    = "~/notes"
 remote   = "me@other-mac.tailnet.ts.net:~/notes"  # or "local:/Volumes/usb/notes"
-exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store etc. always excluded
+exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store, ._* etc. always excluded
 checksum = false           # true: sha256 change detection (catches edits that
                            # preserve size+mtime, at the cost of hashing every scan)
 delta_min_bytes = 0        # files >= this use rsync delta transfer instead of tar
@@ -92,11 +92,24 @@ delta_min_bytes = 0        # files >= this use rsync delta transfer instead of t
 
 ## Continuous sync (daemon)
 
-`caravan daemon install <name> --interval 5s` writes a LaunchAgent that runs
-`caravan sync --watch` for that entry — survives logout/reboot, logs to
-`~/Library/Logs/caravan/<name>.log`. `daemon status` shows plist/running/PID/
-last-sync; `daemon uninstall` removes it. A per-entry lock means a daemon and a
-manual `caravan sync` never race the same state (the loser skips politely).
+`caravan daemon install <name> --interval 5s` registers `caravan sync --watch`
+for that entry with the platform's service manager, so it survives logout and
+reboot. `daemon status` shows unit/running/PID/last-sync; `daemon uninstall`
+removes it. A per-entry lock means a daemon and a manual `caravan sync` never
+race the same state (the loser skips politely).
+
+| | macOS | Linux |
+|---|---|---|
+| manager | launchd | `systemctl --user` |
+| unit | `~/Library/LaunchAgents/dev.caravan.sync.<name>.plist` | `~/.config/systemd/user/caravan-sync-<name>.service` |
+| logs | `~/Library/Logs/caravan/<name>.log` | `~/.local/state/caravan/logs/<name>.log` |
+| restart | `KeepAlive` | `Restart=always`, `RestartSec=5` |
+
+On Linux the unit is a **user** unit, not a system one: the sync runs as you,
+reads your ssh agent and your `~/.config/caravan`, and needs no root. A user
+manager normally only exists while you are logged in, so `daemon install`
+checks lingering and tells you to run `sudo loginctl enable-linger $USER` if it
+is off — without it the daemon looks installed and then stops at logout.
 
 ## Sync model
 
@@ -165,7 +178,7 @@ bidirectional sync with self-updating remotes, checksum mode, chmod
 propagation, conflict-loser backups, rsync delta transfer, launchd daemon,
 hub-and-spoke topologies, `doctor` diagnostics, and release tooling.
 Deliberately not built (Tier 2+, see `../PLAN.md`): FUSE/VFS anything,
-conflict UI, block-level custom delta, non-macOS daemons.
+conflict UI, block-level custom delta.
 
 
 ## Services and exposure
