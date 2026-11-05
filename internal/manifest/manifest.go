@@ -71,7 +71,12 @@ func (s Sync) DeltaThreshold() int64 {
 }
 
 // DefaultExcludes are applied to every sync folder in addition to its own list.
-var DefaultExcludes = []string{".git", "node_modules", ".DS_Store", "dist", "target", ".next", ".cache", ".caravan-staging"}
+//
+// "._*" is AppleDouble sidecars. macOS tar never archives a "._X" member (it
+// treats it as X's metadata), so a pull of one exits 0 having moved nothing,
+// the next scan sees it missing again, and it is re-pulled on every pass
+// forever. Excluding it also stops one host's sidecars spreading to the rest.
+var DefaultExcludes = []string{".git", "node_modules", ".DS_Store", "._*", "dist", "target", ".next", ".cache", ".caravan-staging"}
 
 // ExpandPath expands a leading "~/" (or bare "~") to the user home directory.
 func ExpandPath(s string) string {

@@ -82,7 +82,7 @@ mise = true                # run `mise install` per repo when mise is on PATH
 name     = "notes"
 local    = "~/notes"
 remote   = "me@other-mac.tailnet.ts.net:~/notes"  # or "local:/Volumes/usb/notes"
-exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store etc. always excluded
+exclude  = ["*.tmp"]       # .git, node_modules, .DS_Store, ._* etc. always excluded
 checksum = false           # true: sha256 change detection (catches edits that
                            # preserve size+mtime, at the cost of hashing every scan)
 delta_min_bytes = 0        # files >= this use rsync delta transfer instead of tar

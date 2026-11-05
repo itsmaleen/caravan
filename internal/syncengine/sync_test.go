@@ -1073,6 +1073,35 @@ func TestBuildBase_SizeMismatch_MissingOnOneSide(t *testing.T) {
 
 // --- Staging dir exclusion ---
 
+// TestAppleDouble_ExcludedFromScan verifies that AppleDouble sidecars ("._X")
+// are dropped by the default excludes, at any depth, while files that merely
+// contain "._" elsewhere in the name are kept. Without this, a sidecar on the
+// remote is planned as a pull on every pass and never lands (issue #5).
+func TestAppleDouble_ExcludedFromScan(t *testing.T) {
+	root := t.TempDir()
+	seedFile(t, root, "index.html", "real", t1())
+	seedFile(t, root, "._index.html", "sidecar", t1())
+	seedFile(t, root, "wiki/tags/._video.md", "sidecar", t1())
+	seedFile(t, root, "wiki/tags/video.md", "real", t1())
+	seedFile(t, root, "notes._draft.md", "real", t1())
+
+	s := manifest.Sync{Name: "x", Local: root, Remote: "local:" + t.TempDir()}
+	entries, _, err := ScanDir(root, s.Excludes(), false)
+	if err != nil {
+		t.Fatalf("ScanDir: %v", err)
+	}
+	for _, want := range []string{"index.html", "wiki/tags/video.md", "notes._draft.md"} {
+		if _, ok := entries[want]; !ok {
+			t.Errorf("%s must be present in scan results", want)
+		}
+	}
+	for _, gone := range []string{"._index.html", "wiki/tags/._video.md"} {
+		if _, ok := entries[gone]; ok {
+			t.Errorf("AppleDouble sidecar %s must be excluded from scan", gone)
+		}
+	}
+}
+
 // TestStagingDir_ExcludedFromScan verifies that .caravan-staging is excluded
 // from ScanDir when DefaultExcludes (as returned by Sync.Excludes()) are used.
 // This matches the actual call site in runSyncEntry.
