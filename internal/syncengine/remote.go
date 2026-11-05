@@ -105,17 +105,19 @@ func EnsureSecureSockDir() error {
 // tear down another entry's master.
 func entryKey(name string) string {
 	sum := sha256.Sum256([]byte(name))
-	return hex.EncodeToString(sum[:6])
+	return hex.EncodeToString(sum[:8])
 }
 
 // controlPath is the ssh ControlMaster socket for THIS process and THIS sync
 // entry. It embeds the pid — so a restart, or another caravan process, can
 // neither inherit nor disturb this master — and a digest of the entry's UNIQUE
 // NAME, so two entries never share a master even when they target the same remote
-// (the manifest guarantees unique names, not unique remotes). Lives under the
-// 0700 sockDir. %r/%h/%p are expanded by ssh at connect time.
+// (the manifest guarantees unique names, not unique remotes). It ends in ssh's
+// %C token (a fixed 40-char hash of the connection tuple) rather than %r@%h-%p,
+// so the *expanded* path is bounded regardless of how long the user/host are and
+// cannot overrun the ~104-char unix-socket limit. Lives under the 0700 sockDir.
 func (r *RemoteConn) controlPath() string {
-	return filepath.Join(sockDir(), fmt.Sprintf("s-%d-%s-%%r@%%h-%%p", os.Getpid(), entryKey(r.Name)))
+	return filepath.Join(sockDir(), fmt.Sprintf("s-%d-%s-%%C", os.Getpid(), entryKey(r.Name)))
 }
 
 // sshBaseArgs are the options applied to every ssh invocation, given the caller's

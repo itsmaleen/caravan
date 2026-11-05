@@ -83,10 +83,14 @@ func CmdSync(args []string) int {
 
 	// Fail closed if the per-uid ssh ControlMaster dir isn't a private 0700 dir
 	// we own — otherwise ssh could route through another local user's mux socket.
-	// Covers both one-shot and watch before any ssh op runs.
-	if err := EnsureSecureSockDir(); err != nil {
-		fmt.Fprintf(os.Stderr, "sync: %v\n", err)
-		return 1
+	// Only when a selected entry actually uses ssh: a local-only manifest opens no
+	// ssh master, so a stale/unsafe socket dir must not fail it. Covers one-shot
+	// and watch before any ssh op runs.
+	if anySSHEntry(entries) {
+		if err := EnsureSecureSockDir(); err != nil {
+			fmt.Fprintf(os.Stderr, "sync: %v\n", err)
+			return 1
+		}
 	}
 
 	if !*watch {
@@ -882,6 +886,17 @@ func countFiles(entries map[string]Entry) int {
 
 func localJoin(root, rel string) string {
 	return root + string(os.PathSeparator) + strings.ReplaceAll(rel, "/", string(os.PathSeparator))
+}
+
+// anySSHEntry reports whether any selected entry uses ssh transport (so the ssh
+// ControlMaster dir must be secured). A local-only manifest opens no ssh.
+func anySSHEntry(entries []manifest.Sync) bool {
+	for _, s := range entries {
+		if r, err := ParseRemote(s.Remote); err == nil && r.Kind == transportSSH {
+			return true
+		}
+	}
+	return false
 }
 
 // parseSyncRemote is ParseRemote plus the entry name, which keys the per-entry
