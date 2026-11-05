@@ -13,7 +13,8 @@ caravan sync          # bidirectional folder sync to another machine over ssh
 caravan sync --watch  # continuous sync: ~1s reaction to changes on either side
 caravan daemon ...    # install | uninstall | status — sync as a launchd service
 caravan secrets ...   # init | set | show | add-machine
-caravan doctor        # diagnose environment, repos, sync pairs, secrets
+caravan doctor        # diagnose environment, repos, sync pairs, secrets, exposure
+caravan service ...   # apply | status | logs | rm — supervise services + publish them
 ```
 
 ## Install
@@ -165,3 +166,85 @@ propagation, conflict-loser backups, rsync delta transfer, launchd daemon,
 hub-and-spoke topologies, `doctor` diagnostics, and release tooling.
 Deliberately not built (Tier 2+, see `../PLAN.md`): FUSE/VFS anything,
 conflict UI, block-level custom delta, non-macOS daemons.
+
+
+## Services and exposure
+
+`caravan up` gets a machine into a known state. `caravan service` runs the
+things that live on it, and — the part no other tool does — puts **exposure in
+the manifest**, next to how the thing runs.
+
+```toml
+[[service]]
+name       = "wrinkles-hub"
+workspace  = "wrinkles"                 # cwd comes from the [[sync]] entry of that name
+command    = "python3 -m http.server {{port}} --directory ./output --bind 127.0.0.1"
+port       = "auto"                     # or a number; auto is deterministic per name
+route      = "/wrinkles"
+visibility = "tailnet"                  # private | tailnet | public
+health     = "GET / 200"
+```
+
+```
+caravan service apply              # write the plist, load it, publish at the declared visibility
+caravan service apply --dry-run    # print every change, touch nothing
+caravan service status             # plist, running, pid, port, declared vs OBSERVED, health, url
+caravan service logs NAME
+caravan service rm NAME
+```
+
+`visibility` is the load-bearing field:
+
+| value | mechanism | who can reach it | identity headers |
+|---|---|---|---|
+| `private` (default) | none | loopback only | n/a |
+| `tailnet` | `tailscale serve` | your tailnet | **yes** — `Tailscale-User-Login` |
+| `public` | `tailscale funnel` | the open internet | **no** |
+
+Three rules, all of them about never widening exposure by accident:
+
+1. **An omitted `visibility` means `private`.** A field you forgot must never open a door.
+2. **`public` requires `--allow-public` on every apply.** A funnel is a decision, not a default.
+3. **`apply` never tears down exposure.** `--prune` prints the exact removal command and stops; nothing that could break someone else's link happens behind your back.
+
+### `caravan doctor` exposure checks
+
+Two checks, and both work on a machine with **no `[[service]]` blocks at all** —
+the drift they catch predates adopting the manifest, which is exactly when you
+need to hear about it.
+
+- **Observed vs declared.** Every live route is compared to the manifest. A
+  route reachable more widely than it declares is a ✗. A **public** route no
+  service declares is a ✗. A tailnet-only undeclared route is a `~`.
+- **Funnel pointing at a dev server.** Dev servers ship unminified source and
+  filesystem handlers; on a funnel that is a source leak, not a
+  misconfiguration. Detected from the process table, falling back to HMR
+  markers in the response body when the process table is unreadable.
+
+A real example — this is what the checks printed the first time they were run
+against the machine that motivated them:
+
+```
+exposure  / → 127.0.0.1:5173         ✗  https://box.ts.net is PUBLIC and declared by no service
+exposure  /wrinkles → 127.0.0.1:18790 ✗ https://box.ts.net/wrinkles is PUBLIC and declared by no service
+exposure  funnel → dev server         ✗  https://box.ts.net serves a dev server (vite) — unminified
+                                          source and fs handlers are public.
+                                          Run: tailscale funnel --set-path=/ off
+```
+
+The non-obvious failure that produced it: **Tailscale's `AllowFunnel` is keyed
+on `host:port`, not on path.** Turning Funnel on for `/` made *every* path
+handler on that port public too. Each step was individually correct. Nothing
+reconciled them — which is the entire argument for putting exposure in the
+manifest.
+
+### What this is not
+
+- **Not an isolation boundary.** Services run as you, with your permissions.
+  If you need real isolation use [Smallweb](https://www.smallweb.run/) or a
+  sandbox provider.
+- **Not for hosting other people's code.** Multi-tenant hosting of small apps
+  has famously bad economics and an unbounded abuse surface. This runs *your*
+  software on *your* machine.
+- **Not a Coolify competitor.** Coolify owns Docker-on-Linux. This is native
+  processes, launchd, and a tailnet, on a Mac you already use.

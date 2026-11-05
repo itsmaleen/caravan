@@ -7,9 +7,11 @@ import (
 
 	"caravan/internal/buildinfo"
 	"caravan/internal/doctor"
+	"caravan/internal/gitremote"
 	"caravan/internal/manifest"
 	"caravan/internal/provision"
 	"caravan/internal/secrets"
+	"caravan/internal/service"
 	"caravan/internal/setup"
 	"caravan/internal/syncengine"
 )
@@ -26,9 +28,16 @@ Usage:
                                                         bidirectional folder sync (ssh or local:)
   caravan daemon <install|uninstall|status> [NAME] [--interval 5s] [-f MANIFEST]
                                                         run sync continuously via launchd (macOS)
+  caravan service <apply|status|logs|rm> [NAME] [--dry-run] [--prune] [--allow-public] [-f MANIFEST]
+                                                        supervise services + publish them at their declared visibility
   caravan setup [--agent NAME] [--headless] [--print-prompt] [-f MANIFEST]
                                                         agent-powered interactive setup wizard
   caravan scan --json DIR [--exclude a,b]               (internal) emit dir state as JSON
+  caravan remote <setup|status> [repo] [-f MANIFEST]    configure split-remote routing + install pre-push hook
+  caravan publish <branch> [--repo NAME] [--onto main] [--at RFC3339] [--force] [-f MANIFEST]
+                                                        promote private branch to public remote (immediate or scheduled)
+  caravan publish --run-due [-f MANIFEST]               fire all due scheduled publishes
+  caravan guard-prepush <remote-name> <remote-url>      (hook) block private branches from public remote
   caravan version                                       print version
 
 Manifest resolution: -f flag > $CARAVAN_MANIFEST > ~/.config/caravan/caravan.toml`
@@ -53,12 +62,20 @@ func main() {
 		code = syncengine.CmdSync(args)
 	case "daemon":
 		code = syncengine.CmdDaemon(args)
+	case "service":
+		code = service.CmdService(args)
 	case "doctor":
 		code = doctor.CmdDoctor(args)
 	case "setup":
 		code = setup.CmdSetup(args)
 	case "scan":
 		code = syncengine.CmdScan(args)
+	case "remote":
+		code = gitremote.CmdRemote(args)
+	case "publish":
+		code = gitremote.CmdPublish(args)
+	case "guard-prepush":
+		code = gitremote.CmdGuardPrepush(args)
 	case "version", "--version", "-v":
 		fmt.Println("caravan " + buildinfo.Version)
 	case "help", "--help", "-h":
