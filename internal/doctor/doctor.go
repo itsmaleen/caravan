@@ -97,6 +97,11 @@ func CmdDoctor(args []string) int {
 		results = append(results, checkSecrets(m)...)
 	}
 
+	// ── exposure checks (run even without a manifest) ─────────────────────────
+	// Deliberately not gated on m: the drift these catch predates adopting the
+	// manifest, and that is exactly when someone needs to be told.
+	results = append(results, checkExposure(m)...)
+
 	render(results)
 
 	for _, r := range results {

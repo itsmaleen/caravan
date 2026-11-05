@@ -298,6 +298,138 @@ func TestDeltaMinBytesRoundTrip(t *testing.T) {
 	}
 }
 
+// ── Split-remote helpers ───────────────────────────────────────────────────
+
+func TestIsPrivateBranch(t *testing.T) {
+	r := manifest.Repo{
+		Name:            "app",
+		URL:             "https://example.com/app.git",
+		PrivateRemote:   "private",
+		PrivateURL:      "git@git.internal:me/app.git",
+		PrivateBranches: []string{"private/*", "embargo/*", "secret/*"},
+	}
+	tests := []struct {
+		branch string
+		want   bool
+	}{
+		{"private/feature", true},
+		{"embargo/cve-2026-0001", true},
+		{"secret/refactor", true},
+		{"main", false},
+		{"feature/public", false},
+		{"release/v1", false},
+	}
+	for _, tt := range tests {
+		got := r.IsPrivateBranch(tt.branch)
+		if got != tt.want {
+			t.Errorf("IsPrivateBranch(%q) = %v, want %v", tt.branch, got, tt.want)
+		}
+	}
+}
+
+func TestIsPrivateBranchDefaults(t *testing.T) {
+	// When PrivateBranches is empty but routing is enabled, defaults kick in.
+	r := manifest.Repo{
+		Name:          "app",
+		URL:           "https://example.com/app.git",
+		PrivateRemote: "private",
+		PrivateURL:    "git@git.internal:me/app.git",
+	}
+	if !r.IsPrivateBranch("private/x") {
+		t.Error("expected private/x to match default globs")
+	}
+	if !r.IsPrivateBranch("embargo/x") {
+		t.Error("expected embargo/x to match default globs")
+	}
+	if r.IsPrivateBranch("main") {
+		t.Error("expected main not to match default globs")
+	}
+}
+
+func TestRoutingEnabled(t *testing.T) {
+	tests := []struct {
+		name    string
+		repo    manifest.Repo
+		enabled bool
+	}{
+		{"both set", manifest.Repo{Name: "r", URL: "u", PrivateRemote: "private", PrivateURL: "url"}, true},
+		{"neither set", manifest.Repo{Name: "r", URL: "u"}, false},
+		{"only remote", manifest.Repo{Name: "r", URL: "u", PrivateRemote: "private"}, false},
+		{"only url", manifest.Repo{Name: "r", URL: "u", PrivateURL: "url"}, false},
+	}
+	for _, tt := range tests {
+		got := tt.repo.RoutingEnabled()
+		if got != tt.enabled {
+			t.Errorf("%s: RoutingEnabled() = %v, want %v", tt.name, got, tt.enabled)
+		}
+	}
+}
+
+func TestPublicRemoteOr(t *testing.T) {
+	r := manifest.Repo{Name: "r", URL: "u"}
+	if got := r.PublicRemoteOr(); got != "origin" {
+		t.Errorf("PublicRemoteOr() with empty = %q, want 'origin'", got)
+	}
+	r.PublicRemote = "upstream"
+	if got := r.PublicRemoteOr(); got != "upstream" {
+		t.Errorf("PublicRemoteOr() with set = %q, want 'upstream'", got)
+	}
+}
+
+func TestValidatePrivateRemotePairs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "caravan.toml")
+
+	// Only remote set, no URL → error.
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: "~/code"},
+		Repos: []manifest.Repo{
+			{Name: "app", URL: "https://example.com/app.git", PrivateRemote: "private"},
+		},
+	}
+	if err := manifest.Save(path, m); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := manifest.Load(path); err == nil {
+		t.Fatal("expected error when private_remote set without private_url")
+	}
+
+	// Both set → OK.
+	m.Repos[0].PrivateURL = "git@git.internal:me/app.git"
+	if err := manifest.Save(path, m); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := manifest.Load(path); err != nil {
+		t.Fatalf("expected no error when both set: %v", err)
+	}
+}
+
+func TestValidatePrivateGlobMatchesMain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "caravan.toml")
+
+	m := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: "~/code"},
+		Repos: []manifest.Repo{
+			{
+				Name:            "app",
+				URL:             "https://example.com/app.git",
+				PrivateRemote:   "private",
+				PrivateURL:      "git@git.internal:me/app.git",
+				PrivateBranches: []string{"*"}, // matches "main"!
+			},
+		},
+	}
+	if err := manifest.Save(path, m); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := manifest.Load(path); err == nil {
+		t.Fatal("expected error when private glob matches 'main'")
+	}
+}
+
 // TestSyncChecksumRoundTrip verifies that the Checksum field on [[sync]] entries
 // survives a Save→Load round-trip and that omitempty keeps it out of the TOML
 // when false.
@@ -341,5 +473,135 @@ func TestSyncChecksumRoundTrip(t *testing.T) {
 	content := string(raw)
 	if !strings.Contains(content, "checksum = true") {
 		t.Errorf("expected 'checksum = true' in TOML output:\n%s", content)
+	}
+}
+
+// ── service block ─────────────────────────────────────────────────────────────
+
+func serviceManifest(s manifest.Service) *manifest.Manifest {
+	return &manifest.Manifest{Version: 1, Workspace: manifest.Workspace{Root: "~/code"}, Services: []manifest.Service{s}}
+}
+
+func TestService_VisibilityDefaultsToPrivate(t *testing.T) {
+	// An omitted field must never widen exposure.
+	if got := (manifest.Service{Name: "a", Command: "x"}).Vis(); got != manifest.VisPrivate {
+		t.Errorf("default visibility = %q, want private", got)
+	}
+}
+
+func TestService_ValidateRejectsUnknownVisibility(t *testing.T) {
+	err := serviceManifest(manifest.Service{Name: "a", Command: "x", Port: "80", Visibility: "world"}).Validate()
+	if err == nil || !strings.Contains(err.Error(), "visibility") {
+		t.Errorf("want a visibility error, got %v", err)
+	}
+}
+
+func TestService_ValidateRequiresPortWhenPublished(t *testing.T) {
+	err := serviceManifest(manifest.Service{Name: "a", Command: "x", Visibility: manifest.VisTailnet}).Validate()
+	if err == nil || !strings.Contains(err.Error(), "needs a port") {
+		t.Errorf("want a port error, got %v", err)
+	}
+	// private without a port is fine
+	if err := serviceManifest(manifest.Service{Name: "a", Command: "x"}).Validate(); err != nil {
+		t.Errorf("private service without a port should validate, got %v", err)
+	}
+}
+
+func TestService_ValidateRejectsDuplicatePorts(t *testing.T) {
+	m := &manifest.Manifest{Services: []manifest.Service{
+		{Name: "a", Command: "x", Port: "8080"},
+		{Name: "b", Command: "x", Port: "8080"},
+	}}
+	err := m.Validate()
+	if err == nil || !strings.Contains(err.Error(), "already claimed") {
+		t.Errorf("want a port-collision error, got %v", err)
+	}
+}
+
+func TestService_ValidateRejectsDuplicateNames(t *testing.T) {
+	m := &manifest.Manifest{Services: []manifest.Service{
+		{Name: "a", Command: "x"},
+		{Name: "a", Command: "y"},
+	}}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate service") {
+		t.Errorf("want a duplicate-name error, got %v", err)
+	}
+}
+
+func TestService_ValidateRejectsBadRouteAndPort(t *testing.T) {
+	if err := serviceManifest(manifest.Service{Name: "a", Command: "x", Port: "80", Route: "wrinkles"}).Validate(); err == nil {
+		t.Error("route without a leading slash should fail")
+	}
+	if err := serviceManifest(manifest.Service{Name: "a", Command: "x", Port: "99999"}).Validate(); err == nil {
+		t.Error("out-of-range port should fail")
+	}
+	if err := serviceManifest(manifest.Service{Name: "a", Command: "x", Port: "eighty"}).Validate(); err == nil {
+		t.Error("non-numeric port should fail")
+	}
+}
+
+func TestService_ValidateRequiresNameAndCommand(t *testing.T) {
+	if err := serviceManifest(manifest.Service{Command: "x"}).Validate(); err == nil {
+		t.Error("missing name should fail")
+	}
+	if err := serviceManifest(manifest.Service{Name: "a"}).Validate(); err == nil {
+		t.Error("missing command should fail")
+	}
+}
+
+func TestParseHealth(t *testing.T) {
+	cases := []struct {
+		spec   string
+		method string
+		path   string
+		code   int
+		bad    bool
+	}{
+		{spec: "GET / 200", method: "GET", path: "/", code: 200},
+		{spec: "/healthz", method: "GET", path: "/healthz", code: 200},
+		{spec: "/healthz 204", method: "GET", path: "/healthz", code: 204},
+		{spec: "head /x 200", method: "HEAD", path: "/x", code: 200},
+		{spec: "GET / abc", bad: true},
+		{spec: "a b c d", bad: true},
+	}
+	for _, c := range cases {
+		method, path, code, err := manifest.ParseHealth(c.spec)
+		if c.bad {
+			if err == nil {
+				t.Errorf("manifest.ParseHealth(%q) should fail", c.spec)
+			}
+			continue
+		}
+		if err != nil || method != c.method || path != c.path || code != c.code {
+			t.Errorf("manifest.ParseHealth(%q) = (%q,%q,%d,%v)", c.spec, method, path, code, err)
+		}
+	}
+}
+
+func TestService_RoundTripsThroughTOML(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "caravan.toml")
+	in := &manifest.Manifest{
+		Version:   1,
+		Workspace: manifest.Workspace{Root: "~/code"},
+		Services: []manifest.Service{{
+			Name: "wrinkles-hub", Workspace: "wrinkles",
+			Command: "python3 -m http.server {{port}} --directory ./output",
+			Port:    "18790", Route: "/wrinkles", Visibility: manifest.VisTailnet, Health: "GET / 200",
+		}},
+	}
+	if err := manifest.Save(p, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := manifest.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Services) != 1 {
+		t.Fatalf("want 1 service, got %d", len(out.Services))
+	}
+	got := out.Services[0]
+	if got.Name != "wrinkles-hub" || got.Port != "18790" || got.Vis() != manifest.VisTailnet || got.RoutePath() != "/wrinkles" {
+		t.Errorf("round-trip lost data: %+v", got)
 	}
 }
