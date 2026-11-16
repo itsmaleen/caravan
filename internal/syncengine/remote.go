@@ -285,7 +285,12 @@ func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window, 
 			cmd += " --since " + since
 		}
 	}
-	return cmd
+	// "; exit $?" stops the remote shell from exec'ing caravan directly. If
+	// caravan is then killed by a signal (macOS SIGKILLs a binary that was
+	// overwritten while running), the shell reports 128+signal, which
+	// looksLikeMissingBinary turns into a re-install. Exec'd directly, the
+	// signal reaches ssh, which exits 255 like a network failure.
+	return cmd + "; exit $?"
 }
 
 // WaitScan runs a long-poll scan on the remote side: it invokes
