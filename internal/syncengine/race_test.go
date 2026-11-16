@@ -10,32 +10,58 @@ import (
 // is recorded as synced without ever being transferred.
 func TestDropUnstable(t *testing.T) {
 	pre := map[string]Entry{
-		"a.txt":  {Size: 10, Mtime: 1},
-		"b.txt":  {Size: 10, Mtime: 1},
-		"dir":    {IsDir: true, Mtime: 1},
-		"pulled": {Size: 5, Mtime: 1},
-		"sub/x":  {Size: 3, Mtime: 1},
+		"a.txt":    {Size: 10, Mtime: 1},
+		"b.txt":    {Size: 10, Mtime: 1},
+		"dir":      {IsDir: true, Mtime: 1},
+		"pulled":   {Size: 5, Mtime: 1},
+		"sub/x":    {Size: 3, Mtime: 1},
+		"gone.txt": {Size: 2, Mtime: 1},
 	}
 	post := map[string]Entry{
-		"a.txt":   {Size: 10, Mtime: 1}, // unchanged: keep
-		"b.txt":   {Size: 10, Mtime: 2}, // same-size edit mid-pass: drop
+		"a.txt":   {Size: 10, Mtime: 1}, // unchanged
+		"b.txt":   {Size: 10, Mtime: 2}, // same-size edit mid-pass
 		"dir":     {IsDir: true, Mtime: 9},
-		"pulled":  {Size: 7, Mtime: 3}, // changed by the pass itself: keep
-		"new.txt": {Size: 1, Mtime: 5}, // created mid-pass: drop
-		"sub/x":   {Size: 4, Mtime: 4}, // under a touched dir: keep
+		"pulled":  {Size: 7, Mtime: 3}, // changed by the pass itself
+		"new.txt": {Size: 1, Mtime: 5}, // created mid-pass
+		"sub/x":   {Size: 4, Mtime: 4}, // under a touched dir
+		// gone.txt deleted mid-pass
 	}
 	got := dropUnstable(pre, post, []string{"pulled", "sub"})
-	for _, want := range []string{"a.txt", "dir", "pulled", "sub/x"} {
-		if _, ok := got[want]; !ok {
-			t.Errorf("%s dropped, want kept", want)
+	want := map[string]Entry{
+		"a.txt":    {Size: 10, Mtime: 1},
+		"b.txt":    {Size: 10, Mtime: 1}, // pre: the edit must still look like a change
+		"dir":      {IsDir: true, Mtime: 9},
+		"pulled":   {Size: 7, Mtime: 3},
+		"sub/x":    {Size: 4, Mtime: 4},
+		"gone.txt": {Size: 2, Mtime: 1}, // pre: the delete must still look like a change
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d entries %v, want %d", len(got), got, len(want))
+	}
+	for p, w := range want {
+		if g, ok := got[p]; !ok || g != w {
+			t.Errorf("%s = %+v (present %v), want %+v", p, g, ok, w)
 		}
 	}
-	for _, gone := range []string{"b.txt", "new.txt"} {
-		if _, ok := got[gone]; ok {
-			t.Errorf("%s kept, want dropped", gone)
-		}
+	if _, ok := got["new.txt"]; ok {
+		t.Error("file created mid-pass entered the base")
 	}
 }
+
+// A local delete made while a pass runs must become a remote delete on the
+// next pass. Before the fix the file left the base and was copied back.
+func TestDeleteDuringPassPropagates(t *testing.T) {
+	f := Entry{Size: 4, Mtime: 100, Mode: 0o644}
+	localPre := map[string]Entry{"keep.txt": f, "gone.txt": f}
+	localPost := map[string]Entry{"keep.txt": f} // gone.txt deleted mid-pass
+	remote := map[string]Entry{"keep.txt": f, "gone.txt": f}
+	base := buildBase(dropUnstable(localPre, localPost, nil), remote)
+	actions := Plan(base, localPost, remote, false)
+	if len(actions) != 1 || actions[0].Op != OpDeleteRemote || actions[0].Path != "gone.txt" {
+		t.Fatalf("next pass plans %+v, want one deleteRemote gone.txt", actions)
+	}
+}
+
 
 func TestTouchedPaths(t *testing.T) {
 	l, r := touchedPaths([]Action{{Op: OpPull, Path: "p"}, {Op: OpPush, Path: "q"}, {Op: OpDeleteRemote, Path: "d"}, {Op: OpMkdirLocal, Path: "m"}})

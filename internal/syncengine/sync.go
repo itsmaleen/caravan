@@ -1069,9 +1069,15 @@ func touchedPaths(actions []Action) (local, remote []string) {
 	return local, remote
 }
 
-// dropUnstable returns post without the files that differ from pre and were
-// not touched by the pass: something else wrote them while the pass ran.
-// Directories are kept, since their mtimes move whenever a child changes.
+// dropUnstable builds a side's post-pass snapshot for the base. Paths the
+// pass changed take their fresh entry from post. Files it did not change keep
+// the entry the pass planned with (pre), so anything else did to them during
+// the pass, an edit or a delete, still differs from the base next time
+// instead of being recorded as in sync. (Recording post here undid deletes:
+// a file deleted mid-pass dropped out of the base, then looked new on the
+// other side and was copied back.) Files created mid-pass are left out until
+// the next pass. Directories always take post, since their mtimes move
+// whenever a child changes.
 func dropUnstable(pre, post map[string]Entry, touched []string) map[string]Entry {
 	set := make(map[string]bool, len(touched))
 	for _, t := range touched {
@@ -1091,12 +1097,16 @@ func dropUnstable(pre, post map[string]Entry, touched []string) map[string]Entry
 	}
 	out := make(map[string]Entry, len(post))
 	for p, e := range post {
-		if !e.IsDir {
-			if old, ok := pre[p]; (!ok || old != e) && !isTouched(p) {
-				continue
-			}
+		if e.IsDir || isTouched(p) {
+			out[p] = e
+		} else if old, ok := pre[p]; ok && !old.IsDir {
+			out[p] = old
 		}
-		out[p] = e
+	}
+	for p, old := range pre {
+		if _, still := post[p]; !still && !old.IsDir && !isTouched(p) {
+			out[p] = old // deleted during the pass: keep it so the delete is seen next pass
+		}
 	}
 	return out
 }
