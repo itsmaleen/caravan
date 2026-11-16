@@ -62,7 +62,6 @@ func TestDeleteDuringPassPropagates(t *testing.T) {
 	}
 }
 
-
 func TestTouchedPaths(t *testing.T) {
 	l, r := touchedPaths([]Action{{Op: OpPull, Path: "p"}, {Op: OpPush, Path: "q"}, {Op: OpDeleteRemote, Path: "d"}, {Op: OpMkdirLocal, Path: "m"}})
 	if len(l) != 2 || l[0] != "p" || l[1] != "m" {

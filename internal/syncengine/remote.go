@@ -370,7 +370,13 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 
 func looksLikeMissingBinary(err error, out []byte) bool {
 	if ee, ok := err.(*exec.ExitError); ok {
-		if ee.ExitCode() == 127 {
+		switch ee.ExitCode() {
+		case 127, 126:
+			return true // not found / not executable
+		case 137:
+			// SIGKILL on launch: on macOS, a binary overwritten in place by
+			// an older caravan is killed on every run. A fresh install fixes
+			// it; anything else that SIGKILLs a scan only costs one re-push.
 			return true
 		}
 		combined := strings.ToLower(string(ee.Stderr) + string(out))
@@ -417,7 +423,7 @@ func (r *RemoteConn) bootstrap() error {
 	defer exeFile.Close()
 
 	bin := RemoteBin()
-	install := r.sshCommand(fmt.Sprintf(`mkdir -p %s && cat > %s && chmod +x %s`, path.Dir(bin), bin, bin))
+	install := r.sshCommand(installScript(bin))
 	install.Stdin = exeFile
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -1136,4 +1142,15 @@ func parseVersion(v string) ([3]int, bool) {
 		out[i] = n
 	}
 	return out, true
+}
+
+// installScript writes the binary to a temp file beside the target and
+// renames it into place. Overwriting a running or previously executed Mach-O
+// in place makes macOS kill every later launch of it (SIGKILL, exit 137),
+// because the kernel caches the old code signature against the inode; a
+// rename gives the new binary a fresh inode. It also means a reader never
+// sees a half-written binary.
+func installScript(bin string) string {
+	return fmt.Sprintf(`mkdir -p %s && cat > %s.new.$$ && chmod +x %s.new.$$ && mv -f %s.new.$$ %s`,
+		path.Dir(bin), bin, bin, bin, bin)
 }

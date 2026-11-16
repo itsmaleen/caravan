@@ -3,6 +3,7 @@ package syncengine
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -349,5 +350,27 @@ func TestVersionOlder(t *testing.T) {
 		if got := versionOlder(c.a, c.b); got != c.want {
 			t.Errorf("versionOlder(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+// The binary must be renamed into place, never overwritten: macOS kills a
+// signed binary whose inode was rewritten (exit 137 on every launch).
+func TestInstallScriptRenames(t *testing.T) {
+	s := installScript("~/.local/bin/caravan")
+	if strings.Contains(s, "cat > ~/.local/bin/caravan &&") {
+		t.Fatalf("installs in place: %s", s)
+	}
+	if !strings.Contains(s, "mv -f ~/.local/bin/caravan.new.$$ ~/.local/bin/caravan") {
+		t.Fatalf("no rename into place: %s", s)
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "sub", "caravan")
+	cmd := exec.Command("sh", "-c", installScript(bin))
+	cmd.Stdin = strings.NewReader("#!/bin/sh\necho ok\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install: %v %s", err, out)
+	}
+	if out, err := exec.Command(bin).Output(); err != nil || strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("installed binary: %q %v", out, err)
 	}
 }

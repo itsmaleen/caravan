@@ -9,4 +9,6 @@ package buildinfo
 // move-staging (one-process remote moves on push).
 // 0.8.1: remote stat after a pass, long-poll --since digest, and an
 // upgrade-only version handshake (never pushes over a newer remote).
-const Version = "0.8.1"
+// 0.8.2: mid-pass deletes propagate; binary installed by rename (macOS
+// SIGKILLs a binary overwritten in place); re-install on exit 126/137.
+const Version = "0.8.2"
