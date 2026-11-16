@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -129,7 +130,7 @@ func (r *RemoteConn) controlPath() string {
 // re-keying — leaves an ssh read() blocking FOREVER, and a single half-open
 // master silently freezes the whole watch loop until the process is killed
 // (observed 2026-08-13: a 7-hour stall after the Mac slept). With these set, ssh
-// detects a dead peer in ~45s (15s × 3) and exits with an error the daemon's
+// detects a dead peer in ~15s (5s × 3) and exits with an error the daemon's
 // backoff/retry already handles; the master self-recycles because the option
 // applies to the master connection too.
 func sshBaseArgs(controlPath string) []string {
@@ -138,7 +139,7 @@ func sshBaseArgs(controlPath string) []string {
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + controlPath,
 		"-o", "ControlPersist=60s",
-		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveInterval=5",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=10",
 	}
@@ -264,9 +265,9 @@ func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window s
 	remotePath := shellRemotePath(r.Root)
 	var cmd string
 	if excArg != "" {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json --exclude %q %s`, excArg, remotePath)
+		cmd = fmt.Sprintf(`%s scan --json --exclude %q %s`, RemoteBin(), excArg, remotePath)
 	} else {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json %s`, remotePath)
+		cmd = fmt.Sprintf(`%s scan --json %s`, RemoteBin(), remotePath)
 	}
 	if hashFiles {
 		cmd += " --hash"
@@ -379,7 +380,7 @@ func looksLikeMissingDir(err error, _ []byte) bool {
 	return false
 }
 
-// bootstrap copies the current executable to ~/.local/bin/caravan on the remote.
+// bootstrap copies the current executable to RemoteBin() on the remote.
 func (r *RemoteConn) bootstrap() error {
 	// Verify architecture matches.
 	uname, err := r.sshCommand("uname -sm").Output()
@@ -402,7 +403,8 @@ func (r *RemoteConn) bootstrap() error {
 	}
 	defer exeFile.Close()
 
-	install := r.sshCommand(`mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
+	bin := RemoteBin()
+	install := r.sshCommand(fmt.Sprintf(`mkdir -p %s && cat > %s && chmod +x %s`, path.Dir(bin), bin, bin))
 	install.Stdin = exeFile
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -987,4 +989,34 @@ func copyFile(src, dst string) error {
 
 	// Preserve mtime (best-effort; runs after rename so dst is already visible).
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+}
+
+// defaultRemoteBin is where caravan installs itself on a remote.
+const defaultRemoteBin = "~/.local/bin/caravan"
+
+// RemoteBin is the caravan path used on remotes. CARAVAN_REMOTE_BIN overrides it
+// so a test build can run beside the installed one without replacing it. The
+// value is spliced into a remote shell command unquoted (so ~ expands), so it
+// is accepted only if it uses safe path characters; otherwise the default wins.
+func RemoteBin() string {
+	v := os.Getenv("CARAVAN_REMOTE_BIN")
+	if v == "" || !safeRemoteBin(v) {
+		return defaultRemoteBin
+	}
+	return v
+}
+
+func safeRemoteBin(v string) bool {
+	if strings.HasSuffix(v, "/") {
+		return false
+	}
+	for _, c := range v {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '/' || c == '.' || c == '_' || c == '-' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }

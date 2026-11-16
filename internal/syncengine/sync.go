@@ -1,6 +1,7 @@
 package syncengine
 
 import (
+	"caravan/internal/watch"
 	"errors"
 	"flag"
 	"fmt"
@@ -159,19 +160,32 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 		remote.closeMaster()
 	}
 
-	// Initial sync pass.
-	if err := runSyncEntry(s, dryRun, true); err != nil {
-		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
-	}
-
 	localRoot := manifest.ExpandPath(s.Local)
 	excludes := s.Excludes()
 
-	// Establish initial local snapshot for change detection.
-	prevLocal, _, _ := ScanDir(localRoot, excludes, s.Checksum)
+	// Initial sync pass. Change detection starts from the snapshot the pass
+	// planned from, so edits made while it ran still count as changes.
+	seen, err := syncPass(s, dryRun, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
+	}
+	prevLocal := seen
+	if prevLocal == nil {
+		prevLocal, _, _ = ScanDir(localRoot, excludes, s.Checksum)
+	}
 
 	backoff := backoffBase
 	var waitSuppressedUntil time.Time
+
+	// Native watching turns a ~1 s poll into ~0.1 s propagation and stops the
+	// idle tree walks. Events only trigger a rescan; the rescan decides.
+	pollEvery := localPoll
+	var localEvents <-chan struct{}
+	if w, err := watch.New(localRoot, func(rel string, isDir bool) bool { return matchesExclude(rel, excludes) }); err == nil {
+		defer w.Close()
+		localEvents = w.C
+		pollEvery = safetyRescan(localPoll)
+	}
 
 	for {
 		// Parse remote to run WaitScan.
@@ -202,8 +216,9 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 			}()
 		}
 
-		// Local poll ticker.
-		ticker := time.NewTicker(localPoll)
+		// Local change detection: native events when available, with a slow
+		// full rescan as the safety net; otherwise poll at localPoll.
+		ticker := time.NewTicker(pollEvery)
 
 		triggered := false
 		var drainWait bool
@@ -216,6 +231,16 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 				// Drain waitCh so the goroutine can exit.
 				go func() { <-waitCh }()
 				return
+
+			case <-localEvents:
+				watch.Settle(localEvents, 20*time.Millisecond, 500*time.Millisecond)
+				cur, _, _ := ScanDir(localRoot, excludes, s.Checksum)
+				if !entriesEqual(prevLocal, cur) {
+					prevLocal = cur
+					triggered = true
+					drainWait = true
+					break pollLoop
+				}
 
 			case <-ticker.C:
 				cur, _, _ := ScanDir(localRoot, excludes, s.Checksum)
@@ -266,11 +291,19 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 		}
 
 		if triggered {
-			if err := runSyncEntry(s, dryRun, true); err != nil {
+			seen, err := syncPass(s, dryRun, true)
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
 			}
-			// Refresh local snapshot after sync.
-			prevLocal, _, _ = ScanDir(localRoot, excludes, s.Checksum)
+			// Compare future polls against what this pass planned from, not a
+			// fresh scan: a fresh scan would absorb files written while the
+			// pass ran, and they would never sync. Changes the pass itself
+			// made (pulls) show up as one extra, cheap pass.
+			if seen != nil {
+				prevLocal = seen
+			} else {
+				prevLocal, _, _ = ScanDir(localRoot, excludes, s.Checksum)
+			}
 		}
 	}
 }
@@ -278,6 +311,16 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 // runSyncEntry runs one sync pass for a single [[sync]] entry. In quiet mode
 // (watch loop) an in-sync pass prints nothing.
 func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
+	_, err := syncPass(s, dryRun, quiet)
+	return err
+}
+
+// syncPass runs one sync pass and returns the local snapshot it planned from
+// (nil when the pass was skipped or failed before scanning). The watch loop
+// compares later polls against exactly this snapshot: anything written after
+// the pass scanned is then still seen as a change, instead of being absorbed
+// into a fresh post-sync scan and never synced.
+func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
 	release, lockErr := AcquireSyncLock(s.Name)
 	if lockErr != nil {
 		if errors.Is(lockErr, ErrSyncBusy) {
@@ -286,20 +329,20 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 			if !quiet {
 				fmt.Printf("- %s skipped: %v\n", s.Name, lockErr)
 			}
-			return nil
+			return nil, nil
 		}
-		return lockErr
+		return nil, lockErr
 	}
 	defer release()
 
 	localRoot := manifest.ExpandPath(s.Local)
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
-		return fmt.Errorf("mkdir local %s: %w", localRoot, err)
+		return nil, fmt.Errorf("mkdir local %s: %w", localRoot, err)
 	}
 
 	remote, err := parseSyncRemote(s)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	excludes := s.Excludes()
@@ -307,19 +350,19 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	// Scan local.
 	localEntries, _, err := ScanDir(localRoot, excludes, s.Checksum)
 	if err != nil {
-		return fmt.Errorf("local scan: %w", err)
+		return nil, fmt.Errorf("local scan: %w", err)
 	}
 
 	// Scan remote (creates remote root if needed).
 	remoteEntries, err := remote.Scan(excludes, s.Checksum)
 	if err != nil {
-		return fmt.Errorf("remote scan: %w", err)
+		return nil, fmt.Errorf("remote scan: %w", err)
 	}
 
 	// Load base snapshot.
 	state, err := LoadState(s.Name)
 	if err != nil {
-		return fmt.Errorf("load state: %w", err)
+		return nil, fmt.Errorf("load state: %w", err)
 	}
 
 	// Plan.
@@ -343,14 +386,14 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 			total := countFiles(localEntries)
 			fmt.Printf("✓ %s in sync (%d files)\n", s.Name, total)
 		}
-		return nil
+		return localEntries, nil
 	}
 
 	// Print plan.
 	printPlan(s.Name, actions)
 
 	if dryRun {
-		return nil
+		return localEntries, nil
 	}
 
 	// Apply.
@@ -359,7 +402,12 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 	// Rescan both sides to build the new authoritative base.
 	newLocal, _, _ := ScanDir(localRoot, excludes, s.Checksum)
 	newRemote, _ := remote.Scan(excludes, s.Checksum)
-	newBase := buildBase(newLocal, newRemote)
+	// Leave out any file that changed during the pass without this pass
+	// changing it: its new content was never transferred, so recording it as
+	// in sync would hide the edit forever (the size guard in buildBase only
+	// catches edits that change the size).
+	touchedL, touchedR := touchedPaths(actions)
+	newBase := buildBase(dropUnstable(localEntries, newLocal, touchedL), dropUnstable(remoteEntries, newRemote, touchedR))
 
 	newState := &State{
 		Pairs:    newBase,
@@ -384,7 +432,7 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 			filepath.Join(resolvedConflictDir(), s.Name), stats.ConflictBackups)
 	}
 
-	return applyErr
+	return localEntries, applyErr
 }
 
 // applyActions executes the plan.
@@ -909,4 +957,59 @@ func parseSyncRemote(s manifest.Sync) (*RemoteConn, error) {
 	}
 	r.Name = s.Name
 	return r, nil
+}
+
+// safetyRescan is the full-rescan interval used when native events drive
+// change detection: slow, because it only catches events the OS dropped.
+func safetyRescan(localPoll time.Duration) time.Duration {
+	if localPoll > 10*time.Second {
+		return localPoll
+	}
+	return 10 * time.Second
+}
+
+// touchedPaths returns the paths a plan changes on each side. A path counts as
+// touched when an action targets it or one of its parent directories.
+func touchedPaths(actions []Action) (local, remote []string) {
+	for _, a := range actions {
+		switch a.Op {
+		case OpPull, OpDeleteLocal, OpMkdirLocal, OpChmodLocal, OpPreDeleteLocal:
+			local = append(local, a.Path)
+		case OpPush, OpDeleteRemote, OpMkdirRemote, OpChmodRemote, OpPreDeleteRemote:
+			remote = append(remote, a.Path)
+		}
+	}
+	return local, remote
+}
+
+// dropUnstable returns post without the files that differ from pre and were
+// not touched by the pass: something else wrote them while the pass ran.
+// Directories are kept, since their mtimes move whenever a child changes.
+func dropUnstable(pre, post map[string]Entry, touched []string) map[string]Entry {
+	set := make(map[string]bool, len(touched))
+	for _, t := range touched {
+		set[t] = true
+	}
+	isTouched := func(p string) bool {
+		for {
+			if set[p] {
+				return true
+			}
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				return false
+			}
+			p = p[:i]
+		}
+	}
+	out := make(map[string]Entry, len(post))
+	for p, e := range post {
+		if !e.IsDir {
+			if old, ok := pre[p]; (!ok || old != e) && !isTouched(p) {
+				continue
+			}
+		}
+		out[p] = e
+	}
+	return out
 }

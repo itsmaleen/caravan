@@ -2,6 +2,7 @@
 package syncengine
 
 import (
+	"caravan/internal/watch"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -177,6 +178,18 @@ func entriesEqual(a, b map[string]Entry) bool {
 // changed=false). It always returns the final entries and whether a change was
 // detected.
 func waitForChange(root string, excludes []string, hashFiles bool, window, poll time.Duration) (map[string]Entry, bool) {
+	// Start watching before the first scan so nothing between the two is
+	// missed. With native events, sleep until something happens (or a slow safety
+	// tick) instead of walking the tree every poll.
+	var events <-chan struct{}
+	if w, werr := watch.New(root, func(rel string, isDir bool) bool { return matchesExclude(rel, excludes) }); werr == nil {
+		defer w.Close()
+		events = w.C
+		if poll < 2*time.Second {
+			poll = 2 * time.Second
+		}
+	}
+
 	initial, _, err := ScanDir(root, excludes, hashFiles)
 	if err != nil {
 		// Treat scan failure as a change so the caller triggers a sync pass.
@@ -185,7 +198,12 @@ func waitForChange(root string, excludes []string, hashFiles bool, window, poll 
 
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
-		time.Sleep(poll)
+		select {
+		case <-events:
+			watch.Settle(events, 20*time.Millisecond, 500*time.Millisecond)
+		case <-time.After(poll):
+		case <-time.After(time.Until(deadline)):
+		}
 		current, _, err := ScanDir(root, excludes, hashFiles)
 		if err != nil {
 			return current, true

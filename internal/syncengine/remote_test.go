@@ -239,7 +239,7 @@ func TestSSHBaseArgsKeepalive(t *testing.T) {
 	cp := "/tmp/caravan-1/s-2-deadbeef-%r@%h-%p"
 	args := strings.Join(sshBaseArgs(cp), " ")
 	for _, want := range []string{
-		"ServerAliveInterval=15",
+		"ServerAliveInterval=5",
 		"ServerAliveCountMax=3",
 		"ConnectTimeout=10",
 		"ControlPath=" + cp,
@@ -284,5 +284,22 @@ func TestControlPathIsolation(t *testing.T) {
 	}
 	if len(expanded) > 104 {
 		t.Errorf("expanded ControlPath %q (%d chars) exceeds the unix socket path limit", expanded, len(expanded))
+	}
+}
+
+func TestRemoteBinOverride(t *testing.T) {
+	t.Setenv("CARAVAN_REMOTE_BIN", "")
+	if got := RemoteBin(); got != defaultRemoteBin {
+		t.Fatalf("unset: got %q", got)
+	}
+	t.Setenv("CARAVAN_REMOTE_BIN", "~/sync-bench/bin/caravan")
+	if got := RemoteBin(); got != "~/sync-bench/bin/caravan" {
+		t.Fatalf("override: got %q", got)
+	}
+	for _, bad := range []string{"~/x; rm -rf ~", "~/a b", "$(id)", "~/dir/"} {
+		t.Setenv("CARAVAN_REMOTE_BIN", bad)
+		if got := RemoteBin(); got != defaultRemoteBin {
+			t.Fatalf("%q: got %q, want default", bad, got)
+		}
 	}
 }
