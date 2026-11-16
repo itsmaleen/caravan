@@ -101,7 +101,7 @@ func TestWaitForChange_ChangedEarly(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, changed := waitForChange(root, nil, false, window, poll)
+	_, changed := waitForChange(root, nil, false, window, poll, "")
 	elapsed := time.Since(start)
 
 	if !changed {
@@ -125,7 +125,7 @@ func TestWaitForChange_NoChange(t *testing.T) {
 	poll := 80 * time.Millisecond
 
 	start := time.Now()
-	_, changed := waitForChange(root, nil, false, window, poll)
+	_, changed := waitForChange(root, nil, false, window, poll, "")
 	elapsed := time.Since(start)
 
 	if changed {
@@ -145,8 +145,35 @@ func TestWaitForChange_EmptyDir(t *testing.T) {
 	window := 400 * time.Millisecond
 	poll := 80 * time.Millisecond
 
-	_, changed := waitForChange(root, nil, false, window, poll)
+	_, changed := waitForChange(root, nil, false, window, poll, "")
 	if changed {
 		t.Error("expected changed=false for stable empty dir")
+	}
+}
+
+// A change made before the long-poll starts must still be reported when the
+// caller passes the digest of the state it last synced.
+func TestWaitForChangeSince(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	synced, _, _ := ScanDir(root, nil, false)
+	digest := EntriesDigest(synced)
+	// The edit lands between two long-polls.
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, changed := waitForChange(root, nil, false, 3*time.Second, 50*time.Millisecond, digest)
+	if !changed {
+		t.Fatal("change made before the poll was not reported")
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("reported after %s, want at once", time.Since(start))
+	}
+	// Without since, the same situation is invisible (the old behaviour).
+	if _, changed := waitForChange(root, nil, false, 300*time.Millisecond, 50*time.Millisecond, ""); changed {
+		t.Error("no-since poll reported a change it could not have seen")
 	}
 }

@@ -303,3 +303,51 @@ func TestRemoteBinOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestMoveStaged(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, ".caravan-staging")
+	if err := os.MkdirAll(filepath.Join(staging, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(staging, "a", "b", "f.txt"), []byte("new"), 0o644)
+	_ = os.WriteFile(filepath.Join(staging, "top.txt"), []byte("t"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "top.txt"), []byte("old"), 0o644)
+	if code := CmdMoveStaging([]string{root}); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	for p, want := range map[string]string{"a/b/f.txt": "new", "top.txt": "t"} {
+		got, err := os.ReadFile(filepath.Join(root, p))
+		if err != nil || string(got) != want {
+			t.Errorf("%s = %q, %v; want %q", p, got, err, want)
+		}
+	}
+}
+
+func TestStagedExtractScriptFastPathFirst(t *testing.T) {
+	s := stagedExtractScript(`"/srv/sync"`)
+	fast, slow := strings.Index(s, "move-staging"), strings.Index(s, "find . -type f")
+	if fast < 0 || slow < 0 || fast > slow {
+		t.Fatalf("want move-staging before the shell fallback: %s", s)
+	}
+}
+
+func TestVersionOlder(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"0.6.1", "0.8.1", true},
+		{"0.8.1", "0.8.1", false},
+		{"0.9.0", "0.8.1", false}, // newer remote: never downgrade it
+		{"0.10.0", "0.9.9", false},
+		{"", "0.8.1", true},
+		{"garbage", "0.8.1", true},
+		{"0.8.1", "", false},
+	}
+	for _, c := range cases {
+		if got := versionOlder(c.a, c.b); got != c.want {
+			t.Errorf("versionOlder(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}

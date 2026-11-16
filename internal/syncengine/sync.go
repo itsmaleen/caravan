@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -165,9 +166,15 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 
 	// Initial sync pass. Change detection starts from the snapshot the pass
 	// planned from, so edits made while it ran still count as changes.
-	seen, err := syncPass(s, dryRun, true)
+	seen, remoteSeen, err := syncPass(s, dryRun, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
+	}
+	// Digest of the remote as of the last pass; the long-poll reports a change
+	// at once if the remote no longer matches it.
+	remoteDigest := ""
+	if remoteSeen != nil {
+		remoteDigest = EntriesDigest(remoteSeen)
 	}
 	prevLocal := seen
 	if prevLocal == nil {
@@ -210,8 +217,9 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 			retryC = time.After(d)
 		} else {
 			waitCh = make(chan waitScanResult, 1)
+			since := remoteDigest
 			go func() {
-				entries, changed, err := remote.WaitScan(excludes, s.Checksum, remoteWindow)
+				entries, changed, err := remote.WaitScan(excludes, s.Checksum, remoteWindow, since)
 				waitCh <- waitScanResult{entries: entries, changed: changed, err: err}
 			}()
 		}
@@ -291,9 +299,14 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 		}
 
 		if triggered {
-			seen, err := syncPass(s, dryRun, true)
+			seen, remoteSeen, err := syncPass(s, dryRun, true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
+			}
+			if remoteSeen != nil {
+				remoteDigest = EntriesDigest(remoteSeen)
+			} else {
+				remoteDigest = "" // unknown: fall back to the poll's own baseline
 			}
 			// Compare future polls against what this pass planned from, not a
 			// fresh scan: a fresh scan would absorb files written while the
@@ -311,7 +324,7 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 // runSyncEntry runs one sync pass for a single [[sync]] entry. In quiet mode
 // (watch loop) an in-sync pass prints nothing.
 func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
-	_, err := syncPass(s, dryRun, quiet)
+	_, _, err := syncPass(s, dryRun, quiet)
 	return err
 }
 
@@ -320,7 +333,9 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 // compares later polls against exactly this snapshot: anything written after
 // the pass scanned is then still seen as a change, instead of being absorbed
 // into a fresh post-sync scan and never synced.
-func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
+// The second result is the remote snapshot as of the end of the pass; the
+// watch loop sends its digest with the next long-poll.
+func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string]Entry, error) {
 	release, lockErr := AcquireSyncLock(s.Name)
 	if lockErr != nil {
 		if errors.Is(lockErr, ErrSyncBusy) {
@@ -329,20 +344,20 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
 			if !quiet {
 				fmt.Printf("- %s skipped: %v\n", s.Name, lockErr)
 			}
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, lockErr
+		return nil, nil, lockErr
 	}
 	defer release()
 
 	localRoot := manifest.ExpandPath(s.Local)
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir local %s: %w", localRoot, err)
+		return nil, nil, fmt.Errorf("mkdir local %s: %w", localRoot, err)
 	}
 
 	remote, err := parseSyncRemote(s)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	excludes := s.Excludes()
@@ -350,19 +365,19 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
 	// Scan local.
 	localEntries, _, err := ScanDir(localRoot, excludes, s.Checksum)
 	if err != nil {
-		return nil, fmt.Errorf("local scan: %w", err)
+		return nil, nil, fmt.Errorf("local scan: %w", err)
 	}
 
 	// Scan remote (creates remote root if needed).
 	remoteEntries, err := remote.Scan(excludes, s.Checksum)
 	if err != nil {
-		return nil, fmt.Errorf("remote scan: %w", err)
+		return nil, nil, fmt.Errorf("remote scan: %w", err)
 	}
 
 	// Load base snapshot.
 	state, err := LoadState(s.Name)
 	if err != nil {
-		return nil, fmt.Errorf("load state: %w", err)
+		return nil, nil, fmt.Errorf("load state: %w", err)
 	}
 
 	// Plan.
@@ -386,28 +401,35 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
 			total := countFiles(localEntries)
 			fmt.Printf("✓ %s in sync (%d files)\n", s.Name, total)
 		}
-		return localEntries, nil
+		return localEntries, remoteEntries, nil
 	}
 
 	// Print plan.
 	printPlan(s.Name, actions)
 
 	if dryRun {
-		return localEntries, nil
+		return localEntries, remoteEntries, nil
 	}
 
 	// Apply.
 	stats, applyErr := applyActions(actions, localRoot, remote, localEntries, remoteEntries, s.Name, s.DeltaThreshold())
 
-	// Rescan both sides to build the new authoritative base.
+	// Rescan local (cheap) and refresh only the remote paths this pass
+	// changed: a full remote scan is the most expensive step of a pass.
+	// Untouched remote paths keep their pre-pass entries, so an edit made on
+	// the remote during the pass still differs from the base next time.
+	touchedL, touchedR := touchedPaths(actions)
 	newLocal, _, _ := ScanDir(localRoot, excludes, s.Checksum)
-	newRemote, _ := remote.Scan(excludes, s.Checksum)
+	newRemote, ok := remoteAfterPass(remote, remoteEntries, actions, touchedR, s.Checksum)
+	if !ok {
+		full, _ := remote.Scan(excludes, s.Checksum)
+		newRemote = dropUnstable(remoteEntries, full, touchedR)
+	}
 	// Leave out any file that changed during the pass without this pass
 	// changing it: its new content was never transferred, so recording it as
 	// in sync would hide the edit forever (the size guard in buildBase only
 	// catches edits that change the size).
-	touchedL, touchedR := touchedPaths(actions)
-	newBase := buildBase(dropUnstable(localEntries, newLocal, touchedL), dropUnstable(remoteEntries, newRemote, touchedR))
+	newBase := buildBase(dropUnstable(localEntries, newLocal, touchedL), newRemote)
 
 	newState := &State{
 		Pairs:    newBase,
@@ -432,7 +454,7 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, error) {
 			filepath.Join(resolvedConflictDir(), s.Name), stats.ConflictBackups)
 	}
 
-	return localEntries, applyErr
+	return localEntries, newRemote, applyErr
 }
 
 // applyActions executes the plan.
@@ -966,6 +988,71 @@ func safetyRescan(localPoll time.Duration) time.Duration {
 		return localPoll
 	}
 	return 10 * time.Second
+}
+
+// remoteAfterPass builds the remote snapshot after applying actions by
+// stat-ing only the touched paths and their parent directories. It reports
+// false when that is not trustworthy (stat failed, or a pushed path is not
+// where the pass put it), and the caller falls back to a full scan.
+func remoteAfterPass(remote *RemoteConn, pre map[string]Entry, actions []Action, touched []string, hash bool) (map[string]Entry, bool) {
+	if len(touched) == 0 {
+		return pre, true
+	}
+	refresh := map[string]bool{}
+	for _, p := range touched {
+		for q := p; q != "." && q != ""; q = path.Dir(q) {
+			refresh[q] = true
+		}
+	}
+	touchedSet := make(map[string]bool, len(touched))
+	for _, p := range touched {
+		touchedSet[p] = true
+	}
+	// Drop entries that will be re-stat'd, and everything under a touched path
+	// (a deleted or replaced subtree).
+	drop := func(p string) bool {
+		if refresh[p] {
+			return true
+		}
+		for q := path.Dir(p); q != "." && q != "/"; q = path.Dir(q) {
+			if touchedSet[q] {
+				return true
+			}
+		}
+		return false
+	}
+	out := make(map[string]Entry, len(pre))
+	for p, e := range pre {
+		if !drop(p) {
+			out[p] = e
+		}
+	}
+	list := make([]string, 0, len(refresh))
+	for p := range refresh {
+		list = append(list, p)
+	}
+	got, err := remote.Stat(list, hash)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sync: %v; falling back to a full remote scan\n", err)
+		return nil, false
+	}
+	for _, a := range actions {
+		_, present := got[a.Path]
+		switch a.Op {
+		case OpPush, OpMkdirRemote:
+			if !present {
+				return nil, false
+			}
+		case OpDeleteRemote:
+			if present {
+				return nil, false
+			}
+		}
+	}
+	for p, e := range got {
+		out[p] = e
+	}
+	return out, true
 }
 
 // touchedPaths returns the paths a plan changes on each side. A path counts as

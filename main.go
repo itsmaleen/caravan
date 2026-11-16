@@ -59,6 +59,10 @@ func main() {
 		code = setup.CmdSetup(args)
 	case "scan":
 		code = syncengine.CmdScan(args)
+	case "stat":
+		code = syncengine.CmdStat(args)
+	case "move-staging":
+		code = syncengine.CmdMoveStaging(args)
 	case "version", "--version", "-v":
 		fmt.Println("caravan " + buildinfo.Version)
 	case "help", "--help", "-h":

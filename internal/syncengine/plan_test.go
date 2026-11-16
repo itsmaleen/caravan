@@ -230,9 +230,9 @@ func TestPlanNestedDirs(t *testing.T) {
 	// Local has a/b/c/ structure; remote is empty.
 	base := map[string]BaseEntry{}
 	local := map[string]Entry{
-		"a":       de(1),
-		"a/b":     de(2),
-		"a/b/c":   de(3),
+		"a":         de(1),
+		"a/b":       de(2),
+		"a/b/c":     de(3),
 		"a/b/f.txt": fe(10, 100),
 	}
 	remote := map[string]Entry{}
@@ -264,9 +264,9 @@ func TestPlanNestedDirs(t *testing.T) {
 func TestPlanDeleteDirsDeepestFirst(t *testing.T) {
 	// base has nested structure; both deleted locally → deleteRemote deepest first.
 	base := map[string]BaseEntry{
-		"a":       be(0, 1, 0, 1, true),
-		"a/b":     be(0, 2, 0, 2, true),
-		"a/b/f":   be(10, 3, 10, 3, false),
+		"a":     be(0, 1, 0, 1, true),
+		"a/b":   be(0, 2, 0, 2, true),
+		"a/b/f": be(10, 3, 10, 3, false),
 	}
 	local := map[string]Entry{}
 	remote := map[string]Entry{
@@ -512,9 +512,9 @@ func TestPlanTypeConflict_ChildSuppression_LocalFileWinsOverRemoteDir(t *testing
 		"flip": fe(50, 3000), // local file, newer wins
 	}
 	remote := map[string]Entry{
-		"flip":         de(1000),           // remote dir, loses
-		"flip/child":   de(1000),           // remote dir child
-		"flip/child/f": fe(10, 1000),       // remote file grandchild
+		"flip":         de(1000),     // remote dir, loses
+		"flip/child":   de(1000),     // remote dir child
+		"flip/child/f": fe(10, 1000), // remote file grandchild
 	}
 	actions := Plan(base, local, remote, false)
 	// Expect: preDeleteRemote(flip) + push(flip).
@@ -574,7 +574,7 @@ func TestPlanChmod_LocalOnlyChange(t *testing.T) {
 	base := map[string]BaseEntry{
 		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
 	}
-	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)} // perm changed
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)}  // perm changed
 	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)} // unchanged
 	actions := Plan(base, local, remote, false)
 	if len(actions) != 1 {
@@ -598,7 +598,7 @@ func TestPlanChmod_RemoteOnlyChange(t *testing.T) {
 	base := map[string]BaseEntry{
 		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
 	}
-	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)} // unchanged
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o644)}  // unchanged
 	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o600)} // perm changed
 	actions := Plan(base, local, remote, false)
 	if len(actions) != 1 {
@@ -651,7 +651,7 @@ func TestPlanChmod_BothChanged_Tie(t *testing.T) {
 	base := map[string]BaseEntry{
 		"f.txt": beMode(100, 1000, 100, 1000, false, 0o644, 0o644),
 	}
-	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)} // same size+mtime as base
+	local := map[string]Entry{"f.txt": feMode(100, 1000, 0o755)}  // same size+mtime as base
 	remote := map[string]Entry{"f.txt": feMode(100, 1000, 0o600)} // same size+mtime as base
 	actions := Plan(base, local, remote, false)
 	if len(actions) != 1 {
