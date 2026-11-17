@@ -204,6 +204,16 @@ func waitForChange(root string, excludes []string, hashFiles bool, window, poll 
 		return initial, true
 	}
 
+	// With native events and a since digest, skip the in-window safety
+	// rescans. Each one walks the whole tree, and with several spokes polling
+	// one hub they were most of the hub's CPU. An event the watcher misses is
+	// still caught within one window: the caller's next poll compares the
+	// tree against since before it waits.
+	trustEvents := events != nil && since != ""
+	if trustEvents {
+		poll = window
+	}
+
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
 		select {
@@ -219,6 +229,9 @@ func waitForChange(root string, excludes []string, hashFiles bool, window, poll 
 		if !entriesEqual(initial, current) {
 			return current, true
 		}
+	}
+	if trustEvents {
+		return initial, false // nothing changed; the caller ignores entries then
 	}
 	// Final scan at window end.
 	final, _, _ := ScanDir(root, excludes, hashFiles)

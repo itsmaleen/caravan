@@ -177,3 +177,30 @@ func TestWaitForChangeSince(t *testing.T) {
 		t.Error("no-since poll reported a change it could not have seen")
 	}
 }
+
+// With a since digest the long-poll trusts native events and does no
+// periodic rescans, but an edit during the window must still be reported
+// promptly, and an idle window must report no change.
+func TestWaitForChangeSinceEvents(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	synced, _, _ := ScanDir(root, nil, false)
+	digest := EntriesDigest(synced)
+	if _, changed := waitForChange(root, nil, false, 500*time.Millisecond, 50*time.Millisecond, digest); changed {
+		t.Fatal("idle window reported a change")
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = os.WriteFile(filepath.Join(root, "b.txt"), []byte("2"), 0o644)
+	}()
+	start := time.Now()
+	_, changed := waitForChange(root, nil, false, 5*time.Second, 50*time.Millisecond, digest)
+	if !changed {
+		t.Fatal("edit during the window was not reported")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("reported after %s; want soon after the edit", d)
+	}
+}

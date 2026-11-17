@@ -11,4 +11,6 @@ package buildinfo
 // upgrade-only version handshake (never pushes over a newer remote).
 // 0.8.2: mid-pass deletes propagate; binary installed by rename (macOS
 // SIGKILLs a binary overwritten in place); re-install on exit 126/137.
-const Version = "0.8.2"
+// 0.8.3: a long-poll with native events and a since digest skips its
+// in-window safety rescans (most of the hub's CPU with several spokes).
+const Version = "0.8.3"
