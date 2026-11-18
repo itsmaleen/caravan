@@ -430,6 +430,10 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 	// in sync would hide the edit forever (the size guard in buildBase only
 	// catches edits that change the size).
 	newBase := buildBase(dropUnstable(localEntries, newLocal, touchedL), newRemote)
+	// A transferred file that no longer looks like what the transfer put
+	// there was edited between placement and the re-read (or never landed).
+	// Don't record it as synced.
+	holdBackUnconfirmed(newBase, state.Pairs, actions, localEntries, newLocal, remoteEntries, newRemote)
 
 	newState := &State{
 		Pairs:    newBase,
@@ -994,22 +998,24 @@ func safetyRescan(localPoll time.Duration) time.Duration {
 // stat-ing only the touched paths and their parent directories. It reports
 // false when that is not trustworthy (stat failed, or a pushed path is not
 // where the pass put it), and the caller falls back to a full scan.
-func remoteAfterPass(remote *RemoteConn, pre map[string]Entry, actions []Action, touched []string, hash bool) (map[string]Entry, bool) {
-	if len(touched) == 0 {
+func remoteAfterPass(remote *RemoteConn, pre map[string]Entry, actions []Action, touched touchSet, hash bool) (map[string]Entry, bool) {
+	all := touched.all()
+	if len(all) == 0 {
 		return pre, true
 	}
 	refresh := map[string]bool{}
-	for _, p := range touched {
+	for _, p := range all {
 		for q := p; q != "." && q != ""; q = path.Dir(q) {
 			refresh[q] = true
 		}
 	}
-	touchedSet := make(map[string]bool, len(touched))
-	for _, p := range touched {
+	touchedSet := make(map[string]bool, len(touched.deep))
+	for _, p := range touched.deep {
 		touchedSet[p] = true
 	}
-	// Drop entries that will be re-stat'd, and everything under a touched path
-	// (a deleted or replaced subtree).
+	// Drop entries that will be re-stat'd, and everything under a deep-touched
+	// path (a deleted or replaced subtree). A chmod'd directory is re-stat'd
+	// but its children are kept: nothing under it changed.
 	drop := func(p string) bool {
 		if refresh[p] {
 			return true
@@ -1055,18 +1061,103 @@ func remoteAfterPass(remote *RemoteConn, pre map[string]Entry, actions []Action,
 	return out, true
 }
 
-// touchedPaths returns the paths a plan changes on each side. A path counts as
-// touched when an action targets it or one of its parent directories.
-func touchedPaths(actions []Action) (local, remote []string) {
+// touchSet is what a plan changes on one side. A deep path is created,
+// replaced or deleted, so everything under it counts as touched too. A shallow
+// path (a chmod) changes only itself: whatever happens to its children during
+// the pass was not done by the pass.
+type touchSet struct {
+	deep, shallow []string
+}
+
+func (t touchSet) all() []string {
+	return append(append(make([]string, 0, len(t.deep)+len(t.shallow)), t.deep...), t.shallow...)
+}
+
+// touchedPaths returns the paths a plan changes on each side.
+func touchedPaths(actions []Action) (local, remote touchSet) {
 	for _, a := range actions {
 		switch a.Op {
-		case OpPull, OpDeleteLocal, OpMkdirLocal, OpChmodLocal, OpPreDeleteLocal:
-			local = append(local, a.Path)
-		case OpPush, OpDeleteRemote, OpMkdirRemote, OpChmodRemote, OpPreDeleteRemote:
-			remote = append(remote, a.Path)
+		case OpPull, OpDeleteLocal, OpMkdirLocal, OpPreDeleteLocal:
+			local.deep = append(local.deep, a.Path)
+		case OpChmodLocal:
+			local.shallow = append(local.shallow, a.Path)
+		case OpPush, OpDeleteRemote, OpMkdirRemote, OpPreDeleteRemote:
+			remote.deep = append(remote.deep, a.Path)
+		case OpChmodRemote:
+			remote.shallow = append(remote.shallow, a.Path)
 		}
 	}
 	return local, remote
+}
+
+// installed reports whether dst still looks like the copy of src a transfer
+// would have left: the same hash when both carry one, otherwise the same size
+// and src's mtime. tar and older rsyncs drop the sub-second part of the mtime,
+// so dst may be up to a second older than src, never newer.
+func installed(src, dst Entry) bool {
+	if src.IsDir || dst.IsDir {
+		return src.IsDir == dst.IsDir
+	}
+	if src.Hash != "" && dst.Hash != "" {
+		return src.Hash == dst.Hash
+	}
+	d := src.Mtime - dst.Mtime
+	return src.Size == dst.Size && d >= 0 && d < int64(time.Second)
+}
+
+// unconfirmedTransfers returns the pushed and pulled files whose destination,
+// as observed after the pass, is not what the transfer installed: something
+// else wrote it between placement and the re-read, or the transfer failed.
+// The source may itself have been edited mid-pass, so a destination matching
+// either the planned or the current source counts as installed.
+func unconfirmedTransfers(actions []Action, localPre, localPost, remotePre, remotePost map[string]Entry) (pushes, pulls []string) {
+	matches := func(p string, dst Entry, srcs ...map[string]Entry) bool {
+		for _, m := range srcs {
+			if src, ok := m[p]; ok && installed(src, dst) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, a := range actions {
+		switch a.Op {
+		case OpPush:
+			if dst, ok := remotePost[a.Path]; ok && !matches(a.Path, dst, localPre, localPost) {
+				pushes = append(pushes, a.Path)
+			}
+		case OpPull:
+			if dst, ok := localPost[a.Path]; ok && !matches(a.Path, dst, remotePre, remotePost) {
+				pulls = append(pulls, a.Path)
+			}
+		}
+	}
+	return pushes, pulls
+}
+
+// holdBackUnconfirmed keeps unconfirmed transfers out of the new base. Each
+// keeps the base entry it had before the pass (or none), so the next pass
+// sees both sides as they really are: a failed push is retried, and an edit
+// that landed on top of a transfer is reconciled as a conflict instead of
+// being recorded as the synced version. For pushes it also puts the pre-pass
+// entry back into remotePost, the snapshot whose digest the next long-poll
+// sends, so the remote reports a change at once and that pass runs.
+func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action, localPre, localPost, remotePre, remotePost map[string]Entry) {
+	pushes, pulls := unconfirmedTransfers(actions, localPre, localPost, remotePre, remotePost)
+	for _, p := range append(pushes, pulls...) {
+		fmt.Fprintf(os.Stderr, "sync: base: skipping %s (changed after it was transferred — will re-reconcile)\n", p)
+		if old, ok := oldBase[p]; ok && !old.Dir {
+			newBase[p] = old
+		} else {
+			delete(newBase, p)
+		}
+	}
+	for _, p := range pushes {
+		if pre, ok := remotePre[p]; ok {
+			remotePost[p] = pre
+		} else {
+			delete(remotePost, p)
+		}
+	}
 }
 
 // dropUnstable builds a side's post-pass snapshot for the base. Paths the
@@ -1077,13 +1168,21 @@ func touchedPaths(actions []Action) (local, remote []string) {
 // a file deleted mid-pass dropped out of the base, then looked new on the
 // other side and was copied back.) Files created mid-pass are left out until
 // the next pass. Directories always take post, since their mtimes move
-// whenever a child changes.
-func dropUnstable(pre, post map[string]Entry, touched []string) map[string]Entry {
-	set := make(map[string]bool, len(touched))
-	for _, t := range touched {
+// whenever a child changes. A file under a chmod'd directory is not touched:
+// the chmod changed the directory alone.
+func dropUnstable(pre, post map[string]Entry, touched touchSet) map[string]Entry {
+	set := make(map[string]bool, len(touched.deep))
+	for _, t := range touched.deep {
 		set[t] = true
 	}
+	shallow := make(map[string]bool, len(touched.shallow))
+	for _, t := range touched.shallow {
+		shallow[t] = true
+	}
 	isTouched := func(p string) bool {
+		if shallow[p] {
+			return true
+		}
 		for {
 			if set[p] {
 				return true
