@@ -3,6 +3,7 @@ package syncengine
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -239,7 +240,7 @@ func TestSSHBaseArgsKeepalive(t *testing.T) {
 	cp := "/tmp/caravan-1/s-2-deadbeef-%r@%h-%p"
 	args := strings.Join(sshBaseArgs(cp), " ")
 	for _, want := range []string{
-		"ServerAliveInterval=15",
+		"ServerAliveInterval=5",
 		"ServerAliveCountMax=3",
 		"ConnectTimeout=10",
 		"ControlPath=" + cp,
@@ -284,5 +285,92 @@ func TestControlPathIsolation(t *testing.T) {
 	}
 	if len(expanded) > 104 {
 		t.Errorf("expanded ControlPath %q (%d chars) exceeds the unix socket path limit", expanded, len(expanded))
+	}
+}
+
+func TestRemoteBinOverride(t *testing.T) {
+	t.Setenv("CARAVAN_REMOTE_BIN", "")
+	if got := RemoteBin(); got != defaultRemoteBin {
+		t.Fatalf("unset: got %q", got)
+	}
+	t.Setenv("CARAVAN_REMOTE_BIN", "~/sync-bench/bin/caravan")
+	if got := RemoteBin(); got != "~/sync-bench/bin/caravan" {
+		t.Fatalf("override: got %q", got)
+	}
+	for _, bad := range []string{"~/x; rm -rf ~", "~/a b", "$(id)", "~/dir/"} {
+		t.Setenv("CARAVAN_REMOTE_BIN", bad)
+		if got := RemoteBin(); got != defaultRemoteBin {
+			t.Fatalf("%q: got %q, want default", bad, got)
+		}
+	}
+}
+
+func TestMoveStaged(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, ".caravan-staging")
+	if err := os.MkdirAll(filepath.Join(staging, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(staging, "a", "b", "f.txt"), []byte("new"), 0o644)
+	_ = os.WriteFile(filepath.Join(staging, "top.txt"), []byte("t"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "top.txt"), []byte("old"), 0o644)
+	if code := CmdMoveStaging([]string{root}); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	for p, want := range map[string]string{"a/b/f.txt": "new", "top.txt": "t"} {
+		got, err := os.ReadFile(filepath.Join(root, p))
+		if err != nil || string(got) != want {
+			t.Errorf("%s = %q, %v; want %q", p, got, err, want)
+		}
+	}
+}
+
+func TestStagedExtractScriptFastPathFirst(t *testing.T) {
+	s := stagedExtractScript(`"/srv/sync"`)
+	fast, slow := strings.Index(s, "move-staging"), strings.Index(s, "find . -type f")
+	if fast < 0 || slow < 0 || fast > slow {
+		t.Fatalf("want move-staging before the shell fallback: %s", s)
+	}
+}
+
+func TestVersionOlder(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"0.6.1", "0.8.1", true},
+		{"0.8.1", "0.8.1", false},
+		{"0.9.0", "0.8.1", false}, // newer remote: never downgrade it
+		{"0.10.0", "0.9.9", false},
+		{"", "0.8.1", true},
+		{"garbage", "0.8.1", true},
+		{"0.8.1", "", false},
+	}
+	for _, c := range cases {
+		if got := versionOlder(c.a, c.b); got != c.want {
+			t.Errorf("versionOlder(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// The binary must be renamed into place, never overwritten: macOS kills a
+// signed binary whose inode was rewritten (exit 137 on every launch).
+func TestInstallScriptRenames(t *testing.T) {
+	s := installScript("~/.local/bin/caravan")
+	if strings.Contains(s, "cat > ~/.local/bin/caravan &&") {
+		t.Fatalf("installs in place: %s", s)
+	}
+	if !strings.Contains(s, "mv -f ~/.local/bin/caravan.new.$$ ~/.local/bin/caravan") {
+		t.Fatalf("no rename into place: %s", s)
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "sub", "caravan")
+	cmd := exec.Command("sh", "-c", installScript(bin))
+	cmd.Stdin = strings.NewReader("#!/bin/sh\necho ok\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install: %v %s", err, out)
+	}
+	if out, err := exec.Command(bin).Output(); err != nil || strings.TrimSpace(string(out)) != "ok" {
+		t.Fatalf("installed binary: %q %v", out, err)
 	}
 }

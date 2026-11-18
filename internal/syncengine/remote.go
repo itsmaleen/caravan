@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -129,7 +131,7 @@ func (r *RemoteConn) controlPath() string {
 // re-keying — leaves an ssh read() blocking FOREVER, and a single half-open
 // master silently freezes the whole watch loop until the process is killed
 // (observed 2026-08-13: a 7-hour stall after the Mac slept). With these set, ssh
-// detects a dead peer in ~45s (15s × 3) and exits with an error the daemon's
+// detects a dead peer in ~15s (5s × 3) and exits with an error the daemon's
 // backoff/retry already handles; the master self-recycles because the option
 // applies to the master connection too.
 func sshBaseArgs(controlPath string) []string {
@@ -138,7 +140,7 @@ func sshBaseArgs(controlPath string) []string {
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + controlPath,
 		"-o", "ControlPersist=60s",
-		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveInterval=5",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=10",
 	}
@@ -205,7 +207,7 @@ func (r *RemoteConn) scanLocal(excludes []string, hashFiles bool) (map[string]En
 }
 
 func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap bool) (map[string]Entry, error) {
-	cmd := r.buildScanCmdStr(excludes, hashFiles, "")
+	cmd := r.buildScanCmdStr(excludes, hashFiles, "", "")
 
 	out, err := r.sshCommand(cmd).Output()
 	if err != nil {
@@ -231,14 +233,20 @@ func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap b
 		return nil, fmt.Errorf("parse remote scan: %w", err)
 	}
 
-	// Version handshake: if the remote binary is a different version, re-push
-	// it and rescan once (allowBootstrap guards against infinite recursion).
-	if result.Version != buildinfo.Version {
+	rememberRemoteVersion(r, result.Version)
+
+	// Version handshake: if the remote binary is OLDER, re-push it and rescan
+	// once (allowBootstrap guards against infinite recursion). Never push over
+	// a newer remote: with several spokes on different versions sharing one
+	// hub, "push on any difference" would swap the hub's binary back and
+	// forth on every scan. Newer remotes stay compatible because new flags
+	// are only sent to remotes that report the same or a newer version.
+	if versionOlder(result.Version, buildinfo.Version) {
 		remoteVer := result.Version
 		if remoteVer == "" {
 			remoteVer = "pre-0.1.1"
 		}
-		fmt.Fprintf(os.Stderr, "remote caravan %s != local %s; updating…\n", remoteVer, buildinfo.Version)
+		fmt.Fprintf(os.Stderr, "remote caravan %s is older than local %s; updating…\n", remoteVer, buildinfo.Version)
 		if allowBootstrap {
 			if berr := r.bootstrap(); berr != nil {
 				fmt.Fprintf(os.Stderr, "caravan: version update failed: %v; proceeding\n", berr)
@@ -259,22 +267,30 @@ func (r *RemoteConn) scanSSH(excludes []string, hashFiles bool, allowBootstrap b
 // buildScanCmdStr returns the shell command string used to invoke
 // `caravan scan --json [--exclude …] [--hash] [--wait <window>]` on the remote.
 // window="" means no --wait flag is appended (standard point-in-time scan).
-func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window string) string {
+func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window, since string) string {
 	excArg := strings.Join(excludes, ",")
 	remotePath := shellRemotePath(r.Root)
 	var cmd string
 	if excArg != "" {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json --exclude %q %s`, excArg, remotePath)
+		cmd = fmt.Sprintf(`%s scan --json --exclude %q %s`, RemoteBin(), excArg, remotePath)
 	} else {
-		cmd = fmt.Sprintf(`~/.local/bin/caravan scan --json %s`, remotePath)
+		cmd = fmt.Sprintf(`%s scan --json %s`, RemoteBin(), remotePath)
 	}
 	if hashFiles {
 		cmd += " --hash"
 	}
 	if window != "" {
 		cmd += " --wait " + window
+		if since != "" {
+			cmd += " --since " + since
+		}
 	}
-	return cmd
+	// "; exit $?" stops the remote shell from exec'ing caravan directly. If
+	// caravan is then killed by a signal (macOS SIGKILLs a binary that was
+	// overwritten while running), the shell reports 128+signal, which
+	// looksLikeMissingBinary turns into a re-install. Exec'd directly, the
+	// signal reaches ssh, which exits 255 like a network failure.
+	return cmd + "; exit $?"
 }
 
 // WaitScan runs a long-poll scan on the remote side: it invokes
@@ -287,20 +303,23 @@ func (r *RemoteConn) buildScanCmdStr(excludes []string, hashFiles bool, window s
 // (older remote without --wait support), WaitScan treats the result as
 // changed=true (safe: the caller will run a full sync pass that no-ops if
 // nothing actually changed).
-func (r *RemoteConn) WaitScan(excludes []string, hashFiles bool, window time.Duration) (map[string]Entry, bool, error) {
+func (r *RemoteConn) WaitScan(excludes []string, hashFiles bool, window time.Duration, since string) (map[string]Entry, bool, error) {
 	switch r.Kind {
 	case transportLocal:
-		entries, changed := waitForChange(r.Root, excludes, hashFiles, window, 250*time.Millisecond)
+		entries, changed := waitForChange(r.Root, excludes, hashFiles, window, 250*time.Millisecond, since)
 		return entries, changed, nil
 	case transportSSH:
-		return r.waitScanSSH(excludes, hashFiles, window)
+		return r.waitScanSSH(excludes, hashFiles, window, since)
 	}
 	return nil, false, fmt.Errorf("unknown transport kind %d", r.Kind)
 }
 
-func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.Duration) (map[string]Entry, bool, error) {
+func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.Duration, since string) (map[string]Entry, bool, error) {
 	windowStr := window.Round(time.Millisecond).String()
-	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr)
+	if !remoteAtLeastLocal(r) {
+		since = "" // an older remote would reject --since
+	}
+	cmdStr := r.buildScanCmdStr(excludes, hashFiles, windowStr, since)
 
 	// Hard-cap the long-poll so a hung ssh read can never freeze the watch loop
 	// indefinitely. Keepalive (sshBaseArgs) is the PRIMARY defense: it kills a
@@ -356,7 +375,13 @@ func (r *RemoteConn) waitScanSSH(excludes []string, hashFiles bool, window time.
 
 func looksLikeMissingBinary(err error, out []byte) bool {
 	if ee, ok := err.(*exec.ExitError); ok {
-		if ee.ExitCode() == 127 {
+		switch ee.ExitCode() {
+		case 127, 126:
+			return true // not found / not executable
+		case 137:
+			// SIGKILL on launch: on macOS, a binary overwritten in place by
+			// an older caravan is killed on every run. A fresh install fixes
+			// it; anything else that SIGKILLs a scan only costs one re-push.
 			return true
 		}
 		combined := strings.ToLower(string(ee.Stderr) + string(out))
@@ -379,7 +404,7 @@ func looksLikeMissingDir(err error, _ []byte) bool {
 	return false
 }
 
-// bootstrap copies the current executable to ~/.local/bin/caravan on the remote.
+// bootstrap copies the current executable to RemoteBin() on the remote.
 func (r *RemoteConn) bootstrap() error {
 	// Verify architecture matches.
 	uname, err := r.sshCommand("uname -sm").Output()
@@ -402,7 +427,8 @@ func (r *RemoteConn) bootstrap() error {
 	}
 	defer exeFile.Close()
 
-	install := r.sshCommand(`mkdir -p ~/.local/bin && cat > ~/.local/bin/caravan && chmod +x ~/.local/bin/caravan`)
+	bin := RemoteBin()
+	install := r.sshCommand(installScript(bin))
 	install.Stdin = exeFile
 	install.Stderr = os.Stderr
 	if err := install.Run(); err != nil {
@@ -537,8 +563,12 @@ func stagedExtractScript(rootExpr string) string {
 		`rm -rf "${root}/.caravan-staging" && ` +
 		`mkdir -p "${root}/.caravan-staging" && ` +
 		`tar -C "${root}/.caravan-staging" -xpf - && ` +
+		// Fast path: caravan moves the files itself (one process). The shell
+		// loop is the fallback for a remote binary too old to know
+		// move-staging; it costs two processes per file (~4 s per 500 files).
+		`{ ` + RemoteBin() + ` move-staging "${root}" 2>/dev/null || { ` +
 		`cd "${root}/.caravan-staging" && ` +
-		`find . -type f -print0 | while IFS= read -r -d '' f; do mkdir -p "${root}/$(dirname "$f")"; mv -f "$f" "${root}/$f"; done && ` +
+		`find . -type f -print0 | while IFS= read -r -d '' f; do mkdir -p "${root}/$(dirname "$f")"; mv -f "$f" "${root}/$f"; done; }; } && ` +
 		`cd / && rm -rf "${root}/.caravan-staging"`
 }
 
@@ -688,28 +718,8 @@ func (r *RemoteConn) pullSSH(localRoot string, paths []string) error {
 		return fmt.Errorf("ssh pull: %w", sshErr)
 	}
 
-	// Tar succeeded: walk staging and move each file atomically into the live tree.
-	moveErr := filepath.WalkDir(stagingDir, func(srcPath string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(stagingDir, srcPath)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		if d.IsDir() {
-			// Ensure the directory exists in the live tree (create, don't move).
-			return os.MkdirAll(filepath.Join(localRoot, rel), 0o755)
-		}
-		dst := filepath.Join(localRoot, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		return os.Rename(srcPath, dst)
-	})
+	// Tar succeeded: move each file atomically into the live tree.
+	moveErr := moveStaged(stagingDir, localRoot)
 
 	os.RemoveAll(stagingDir) //nolint
 	if moveErr != nil {
@@ -987,4 +997,165 @@ func copyFile(src, dst string) error {
 
 	// Preserve mtime (best-effort; runs after rename so dst is already visible).
 	return os.Chtimes(dst, info.ModTime(), info.ModTime())
+}
+
+// defaultRemoteBin is where caravan installs itself on a remote.
+const defaultRemoteBin = "~/.local/bin/caravan"
+
+// RemoteBin is the caravan path used on remotes. CARAVAN_REMOTE_BIN overrides it
+// so a test build can run beside the installed one without replacing it. The
+// value is spliced into a remote shell command unquoted (so ~ expands), so it
+// is accepted only if it uses safe path characters; otherwise the default wins.
+func RemoteBin() string {
+	v := os.Getenv("CARAVAN_REMOTE_BIN")
+	if v == "" || !safeRemoteBin(v) {
+		return defaultRemoteBin
+	}
+	return v
+}
+
+func safeRemoteBin(v string) bool {
+	if strings.HasSuffix(v, "/") {
+		return false
+	}
+	for _, c := range v {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '/' || c == '.' || c == '_' || c == '-' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// moveStaged renames every regular file under stagingDir to the same relative
+// path under root, creating directories as needed. Each rename is atomic, so a
+// reader sees either the old file or the complete new one.
+func moveStaged(stagingDir, root string) error {
+	return filepath.WalkDir(stagingDir, func(srcPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(stagingDir, srcPath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(root, rel), 0o755)
+		}
+		dst := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.Rename(srcPath, dst)
+	})
+}
+
+// CmdMoveStaging implements `caravan move-staging ROOT`, run on the remote by
+// a push: it moves ROOT/.caravan-staging into ROOT in one process.
+func CmdMoveStaging(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: caravan move-staging ROOT")
+		return 2
+	}
+	root := args[0]
+	if err := moveStaged(filepath.Join(root, ".caravan-staging"), root); err != nil {
+		fmt.Fprintf(os.Stderr, "move-staging: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// Stat returns the remote entries for paths (relative to the root). It fails
+// if the remote binary is a different version, so callers fall back to a full
+// scan rather than trust an older binary that may not know `stat`.
+func (r *RemoteConn) Stat(paths []string, hashFiles bool) (map[string]Entry, error) {
+	if r.Kind == transportLocal {
+		return StatPaths(r.Root, paths, hashFiles), nil
+	}
+	flags := " --json"
+	if hashFiles {
+		flags += " --hash"
+	}
+	cmd := r.sshCommand(fmt.Sprintf(`%s stat%s %s`, RemoteBin(), flags, shellRemotePath(r.Root)))
+	cmd.Stdin = strings.NewReader(strings.Join(paths, "\n") + "\n")
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("remote stat: %w (stderr: %s)", err, errb.String())
+	}
+	var res ScanResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		return nil, fmt.Errorf("parse remote stat: %w", err)
+	}
+	if versionOlder(res.Version, buildinfo.Version) {
+		return nil, fmt.Errorf("remote stat: remote version %q is older than %q", res.Version, buildinfo.Version)
+	}
+	return res.Entries, nil
+}
+
+// remoteVersions remembers the version each remote reported on its last full
+// scan, keyed by host and root. RemoteConn values are rebuilt every watch
+// iteration, so the cache lives at package level.
+var remoteVersions sync.Map
+
+func remoteKey(r *RemoteConn) string { return r.Host + "\x00" + r.Root }
+
+func rememberRemoteVersion(r *RemoteConn, v string) { remoteVersions.Store(remoteKey(r), v) }
+
+// remoteAtLeastLocal reports whether the remote last reported a version at
+// least as new as this binary, so it understands every flag this one sends.
+func remoteAtLeastLocal(r *RemoteConn) bool {
+	v, ok := remoteVersions.Load(remoteKey(r))
+	return ok && !versionOlder(v.(string), buildinfo.Version)
+}
+
+// versionOlder reports whether a is an older release than b. Versions are
+// dotted numbers ("0.8.1"); an empty or unparseable version counts as oldest.
+func versionOlder(a, b string) bool {
+	pa, oka := parseVersion(a)
+	pb, okb := parseVersion(b)
+	if !okb {
+		return false
+	}
+	if !oka {
+		return true
+	}
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
+}
+
+func parseVersion(v string) ([3]int, bool) {
+	var out [3]int
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+// installScript writes the binary to a temp file beside the target and
+// renames it into place. Overwriting a running or previously executed Mach-O
+// in place makes macOS kill every later launch of it (SIGKILL, exit 137),
+// because the kernel caches the old code signature against the inode; a
+// rename gives the new binary a fresh inode. It also means a reader never
+// sees a half-written binary.
+func installScript(bin string) string {
+	return fmt.Sprintf(`mkdir -p %s && cat > %s.new.$$ && chmod +x %s.new.$$ && mv -f %s.new.$$ %s`,
+		path.Dir(bin), bin, bin, bin, bin)
 }

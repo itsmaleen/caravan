@@ -1013,7 +1013,7 @@ func TestConflictBackup_Pruning(t *testing.T) {
 func TestBuildBase_SizeMismatch_SkipsFilePair(t *testing.T) {
 	local := map[string]Entry{
 		"good.txt":    {Size: 100, Mtime: t1().UnixNano(), Mode: 0o644},
-		"partial.txt": {Size: 50, Mtime: t1().UnixNano(), Mode: 0o644},  // partial
+		"partial.txt": {Size: 50, Mtime: t1().UnixNano(), Mode: 0o644}, // partial
 	}
 	remote := map[string]Entry{
 		"good.txt":    {Size: 100, Mtime: t1().UnixNano(), Mode: 0o644},
