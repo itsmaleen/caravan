@@ -347,7 +347,11 @@ func TestDropUnstableChmodFileKeepsContent(t *testing.T) {
 // edit or a delete a remote writer made to the file during the pass.
 func TestRemoteAfterPassChmodFileKeepsContent(t *testing.T) {
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "f"), []byte("hers"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("hers"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The pass's chmod (WriteFile's mode is subject to the umask).
+	if err := os.Chmod(filepath.Join(root, "f"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	pre := map[string]Entry{
@@ -439,5 +443,66 @@ func TestFailedPullReportsPendingWork(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(localRoot, "f.txt")); err != nil || string(b) != "data" {
 		t.Fatalf("after the retry local f.txt = %q, %v", b, err)
+	}
+}
+
+// A delete that fails leaves the file on one side only. The retry must try
+// the delete again, not take the survivor for a new file and copy it back.
+func TestFailedDeleteIsRetriedNotUndone(t *testing.T) {
+	f := Entry{Size: 4, Mtime: 100, Mode: 0o644}
+	d := Entry{IsDir: true, Mtime: 1, Mode: 0o755}
+	for _, side := range []string{"remote", "local"} {
+		both := map[string]Entry{"d": d, "d/f": f}
+		gone := map[string]Entry{"d": d} // the user deleted d/f on this side
+		oldBase := buildBase(both, both)
+		localPre, remotePre, wantOp := gone, both, OpDeleteRemote
+		if side == "local" {
+			localPre, remotePre, wantOp = both, gone, OpDeleteLocal
+		}
+		actions := Plan(oldBase, localPre, remotePre, false)
+		if len(actions) != 1 || actions[0].Op != wantOp {
+			t.Fatalf("%s: setup: plan = %+v, want one %s", side, actions, wantOp)
+		}
+		// The delete fails: both sides look exactly as before the pass.
+		touchedL, touchedR := touchedPaths(actions)
+		base := buildBase(dropUnstable(localPre, localPre, touchedL), dropUnstable(remotePre, remotePre, touchedR))
+		if held := holdBackUnconfirmed(base, oldBase, actions, localPre, localPre, remotePre, remotePre); held != 1 {
+			t.Errorf("%s: held back %d actions, want 1 (so the pass reports pending work)", side, held)
+		}
+		next := Plan(base, localPre, remotePre, false)
+		if len(next) != 1 || next[0].Op != wantOp || next[0].Path != "d/f" {
+			t.Fatalf("%s: the retry plans %+v, want one %s d/f", side, next, wantOp)
+		}
+
+		// Control: a delete that worked leaves no base entry and nothing to do.
+		base = buildBase(gone, gone)
+		if held := holdBackUnconfirmed(base, oldBase, actions, localPre, gone, remotePre, gone); held != 0 {
+			t.Errorf("%s: a successful delete was held back", side)
+		}
+		if _, ok := base["d/f"]; ok {
+			t.Errorf("%s: a successful delete kept its base entry", side)
+		}
+	}
+}
+
+// A pass that never got to plan (the entry is locked, or a scan failed) must
+// not clear a retry an earlier pass scheduled.
+func TestSkippedPassStaysPending(t *testing.T) {
+	setupStateDir(t)
+	s := manifest.Sync{Name: "busy", Local: t.TempDir(), Remote: "local:" + t.TempDir()}
+	release, err := AcquireSyncLock(s.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen, _, pending, err := syncPass(s, false, true)
+	release()
+	if seen != nil || err != nil {
+		t.Fatalf("setup: the locked pass ran (seen=%v err=%v)", seen != nil, err)
+	}
+	if !pending {
+		t.Error("a skipped pass reported no pending work")
+	}
+	if _, _, pending, err := syncPass(s, false, true); err != nil || pending {
+		t.Errorf("unlocked pass: pending=%v err=%v, want a clean pass", pending, err)
 	}
 }

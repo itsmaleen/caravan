@@ -389,7 +389,9 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 // The third result reports work the pass planned but could not finish or
 // confirm (a transfer failed, or its destination is not what was installed).
 // Both snapshots can still match their trees, so no change would ever fire;
-// the watch loop schedules a retry instead of waiting for one.
+// the watch loop schedules a retry instead of waiting for one. A pass that
+// was skipped (the entry is locked) or failed before it could plan reports
+// the same: it examined nothing, so it cannot clear work an earlier pass left.
 func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string]Entry, bool, error) {
 	release, lockErr := AcquireSyncLock(s.Name)
 	if lockErr != nil {
@@ -399,20 +401,20 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 			if !quiet {
 				fmt.Printf("- %s skipped: %v\n", s.Name, lockErr)
 			}
-			return nil, nil, false, nil
+			return nil, nil, true, nil
 		}
-		return nil, nil, false, lockErr
+		return nil, nil, true, lockErr
 	}
 	defer release()
 
 	localRoot := manifest.ExpandPath(s.Local)
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
-		return nil, nil, false, fmt.Errorf("mkdir local %s: %w", localRoot, err)
+		return nil, nil, true, fmt.Errorf("mkdir local %s: %w", localRoot, err)
 	}
 
 	remote, err := parseSyncRemote(s)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, true, err
 	}
 
 	excludes := s.Excludes()
@@ -420,19 +422,19 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 	// Scan local.
 	localEntries, _, err := ScanDir(localRoot, excludes, s.Checksum)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("local scan: %w", err)
+		return nil, nil, true, fmt.Errorf("local scan: %w", err)
 	}
 
 	// Scan remote (creates remote root if needed).
 	remoteEntries, err := remote.Scan(excludes, s.Checksum)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("remote scan: %w", err)
+		return nil, nil, true, fmt.Errorf("remote scan: %w", err)
 	}
 
 	// Load base snapshot.
 	state, err := LoadState(s.Name)
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("load state: %w", err)
+		return nil, nil, true, fmt.Errorf("load state: %w", err)
 	}
 
 	// Plan.
@@ -1214,7 +1216,8 @@ func unconfirmedTransfers(actions []Action, localPre, localPost, remotePre, remo
 // being recorded as the synced version. For pushes it also puts the pre-pass
 // entry back into remotePost, the snapshot whose digest the next long-poll
 // sends, so the remote reports a change at once and that pass runs. It
-// returns how many transfers it held back.
+// does the same for deletes that did not happen, and returns how many
+// actions it held back.
 func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action, localPre, localPost, remotePre, remotePost map[string]Entry) int {
 	pushes, pulls := unconfirmedTransfers(actions, localPre, localPost, remotePre, remotePost)
 	for _, p := range append(pushes, pulls...) {
@@ -1232,7 +1235,32 @@ func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action
 			delete(remotePost, p)
 		}
 	}
-	return len(pushes) + len(pulls)
+	// A delete that did not happen leaves the path on one side only, so
+	// buildBase dropped it. Without its base entry the next pass would take the
+	// surviving copy for a new file and copy it back, undoing the delete. Keep
+	// the entry until the delete succeeds: the next pass then retries it, or
+	// sees a conflict if the survivor was edited.
+	held := len(pushes) + len(pulls)
+	for _, a := range actions {
+		var post map[string]Entry
+		switch a.Op {
+		case OpDeleteRemote:
+			post = remotePost
+		case OpDeleteLocal:
+			post = localPost
+		default:
+			continue
+		}
+		if _, still := post[a.Path]; !still {
+			continue
+		}
+		if old, ok := oldBase[a.Path]; ok {
+			fmt.Fprintf(os.Stderr, "sync: base: keeping %s (its delete did not happen — will retry)\n", a.Path)
+			newBase[a.Path] = old
+			held++
+		}
+	}
+	return held
 }
 
 // dropUnstable builds a side's post-pass snapshot for the base. Paths the
