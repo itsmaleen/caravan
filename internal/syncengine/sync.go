@@ -166,10 +166,14 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 
 	// Initial sync pass. Change detection starts from the snapshot the pass
 	// planned from, so edits made while it ran still count as changes.
-	seen, remoteSeen, err := syncPass(s, dryRun, true)
+	seen, remoteSeen, pending, err := syncPass(s, dryRun, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
 	}
+	// A pass that left work unfinished is retried on a timer: nothing else
+	// would trigger one, since neither tree changed.
+	var retry passRetry
+	retry.after(pending && !dryRun, time.Now())
 	// Digest of the remote as of the last pass; the long-poll reports a change
 	// at once if the remote no longer matches it.
 	remoteDigest := ""
@@ -227,6 +231,7 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 		// Local change detection: native events when available, with a slow
 		// full rescan as the safety net; otherwise poll at localPoll.
 		ticker := time.NewTicker(pollEvery)
+		passRetryC := retry.C(time.Now())
 
 		triggered := false
 		var drainWait bool
@@ -259,6 +264,12 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 					break pollLoop
 				}
 
+			case <-passRetryC:
+				// The last pass left a transfer unfinished; try again.
+				triggered = true
+				drainWait = true
+				break pollLoop
+
 			case <-retryC:
 				// Backoff window over — restart the loop to attempt a fresh
 				// long-poll. (retryC is nil unless suppressed; nil never fires.)
@@ -290,7 +301,7 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 
 		ticker.Stop()
 
-		if drainWait {
+		if drainWait && waitCh != nil {
 			// Local change fired first; drain the in-flight WaitScan asynchronously
 			// so its goroutine is not leaked. A single redundant sync pass from a
 			// late-arriving changed=true is acceptable (cheap no-op or catches an
@@ -299,10 +310,11 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 		}
 
 		if triggered {
-			seen, remoteSeen, err := syncPass(s, dryRun, true)
+			seen, remoteSeen, pending, err := syncPass(s, dryRun, true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "sync %s: %v\n", s.Name, err)
 			}
+			retry.after(pending && !dryRun, time.Now())
 			if remoteSeen != nil {
 				remoteDigest = EntriesDigest(remoteSeen)
 			} else {
@@ -321,10 +333,49 @@ func runWatchEntry(s manifest.Sync, dryRun bool, localPoll time.Duration, sigCh 
 	}
 }
 
+// passRetry schedules a retry pass after one that left work unfinished. The
+// delay doubles from passRetryBase up to passRetryMax while passes keep
+// failing, so a file that can never transfer costs one pass every few minutes,
+// and it resets once a pass finishes cleanly.
+type passRetry struct {
+	at      time.Time // zero: no retry due
+	backoff time.Duration
+}
+
+const (
+	passRetryBase = 5 * time.Second
+	passRetryMax  = 5 * time.Minute
+)
+
+// after records the outcome of a pass that ended at now.
+func (r *passRetry) after(pending bool, now time.Time) {
+	if !pending {
+		*r = passRetry{}
+		return
+	}
+	switch {
+	case r.backoff == 0:
+		r.backoff = passRetryBase
+	case r.backoff*2 > passRetryMax:
+		r.backoff = passRetryMax
+	default:
+		r.backoff *= 2
+	}
+	r.at = now.Add(r.backoff)
+}
+
+// C fires when the retry is due, and never when none is scheduled.
+func (r *passRetry) C(now time.Time) <-chan time.Time {
+	if r.at.IsZero() {
+		return nil
+	}
+	return time.After(r.at.Sub(now))
+}
+
 // runSyncEntry runs one sync pass for a single [[sync]] entry. In quiet mode
 // (watch loop) an in-sync pass prints nothing.
 func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
-	_, _, err := syncPass(s, dryRun, quiet)
+	_, _, _, err := syncPass(s, dryRun, quiet)
 	return err
 }
 
@@ -335,7 +386,11 @@ func runSyncEntry(s manifest.Sync, dryRun, quiet bool) error {
 // into a fresh post-sync scan and never synced.
 // The second result is the remote snapshot as of the end of the pass; the
 // watch loop sends its digest with the next long-poll.
-func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string]Entry, error) {
+// The third result reports work the pass planned but could not finish or
+// confirm (a transfer failed, or its destination is not what was installed).
+// Both snapshots can still match their trees, so no change would ever fire;
+// the watch loop schedules a retry instead of waiting for one.
+func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string]Entry, bool, error) {
 	release, lockErr := AcquireSyncLock(s.Name)
 	if lockErr != nil {
 		if errors.Is(lockErr, ErrSyncBusy) {
@@ -344,20 +399,20 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 			if !quiet {
 				fmt.Printf("- %s skipped: %v\n", s.Name, lockErr)
 			}
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
-		return nil, nil, lockErr
+		return nil, nil, false, lockErr
 	}
 	defer release()
 
 	localRoot := manifest.ExpandPath(s.Local)
 	if err := os.MkdirAll(localRoot, 0o755); err != nil {
-		return nil, nil, fmt.Errorf("mkdir local %s: %w", localRoot, err)
+		return nil, nil, false, fmt.Errorf("mkdir local %s: %w", localRoot, err)
 	}
 
 	remote, err := parseSyncRemote(s)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	excludes := s.Excludes()
@@ -365,19 +420,19 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 	// Scan local.
 	localEntries, _, err := ScanDir(localRoot, excludes, s.Checksum)
 	if err != nil {
-		return nil, nil, fmt.Errorf("local scan: %w", err)
+		return nil, nil, false, fmt.Errorf("local scan: %w", err)
 	}
 
 	// Scan remote (creates remote root if needed).
 	remoteEntries, err := remote.Scan(excludes, s.Checksum)
 	if err != nil {
-		return nil, nil, fmt.Errorf("remote scan: %w", err)
+		return nil, nil, false, fmt.Errorf("remote scan: %w", err)
 	}
 
 	// Load base snapshot.
 	state, err := LoadState(s.Name)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load state: %w", err)
+		return nil, nil, false, fmt.Errorf("load state: %w", err)
 	}
 
 	// Plan.
@@ -401,14 +456,14 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 			total := countFiles(localEntries)
 			fmt.Printf("✓ %s in sync (%d files)\n", s.Name, total)
 		}
-		return localEntries, remoteEntries, nil
+		return localEntries, remoteEntries, false, nil
 	}
 
 	// Print plan.
 	printPlan(s.Name, actions)
 
 	if dryRun {
-		return localEntries, remoteEntries, nil
+		return localEntries, remoteEntries, false, nil
 	}
 
 	// Apply.
@@ -433,7 +488,7 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 	// A transferred file that no longer looks like what the transfer put
 	// there was edited between placement and the re-read (or never landed).
 	// Don't record it as synced.
-	holdBackUnconfirmed(newBase, state.Pairs, actions, localEntries, newLocal, remoteEntries, newRemote)
+	unconfirmed := holdBackUnconfirmed(newBase, state.Pairs, actions, localEntries, newLocal, remoteEntries, newRemote)
 
 	newState := &State{
 		Pairs:    newBase,
@@ -458,7 +513,7 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 			filepath.Join(resolvedConflictDir(), s.Name), stats.ConflictBackups)
 	}
 
-	return localEntries, newRemote, applyErr
+	return localEntries, newRemote, stats.Errors > 0 || unconfirmed > 0, applyErr
 }
 
 // applyActions executes the plan.
@@ -1058,7 +1113,25 @@ func remoteAfterPass(remote *RemoteConn, pre map[string]Entry, actions []Action,
 	for p, e := range got {
 		out[p] = e
 	}
+	// A chmod'd file takes only its new mode from the stat. Its content was not
+	// transferred, so an edit or delete made to it during the pass must still
+	// differ from the base, and from the digest the next long-poll sends.
+	for _, p := range touched.shallow {
+		if old, ok := pre[p]; ok && !old.IsDir {
+			out[p] = modeOnly(old, got[p])
+		}
+	}
 	return out, true
+}
+
+// modeOnly is the entry to record for a chmod'd file: what the pass planned
+// with (pre), carrying the permission bits now on disk. post is the zero Entry
+// when the file is gone, and pre is then kept whole.
+func modeOnly(pre, post Entry) Entry {
+	if post != (Entry{}) && !post.IsDir {
+		pre.Mode = post.Mode
+	}
+	return pre
 }
 
 // touchSet is what a plan changes on one side. A deep path is created,
@@ -1140,8 +1213,9 @@ func unconfirmedTransfers(actions []Action, localPre, localPost, remotePre, remo
 // that landed on top of a transfer is reconciled as a conflict instead of
 // being recorded as the synced version. For pushes it also puts the pre-pass
 // entry back into remotePost, the snapshot whose digest the next long-poll
-// sends, so the remote reports a change at once and that pass runs.
-func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action, localPre, localPost, remotePre, remotePost map[string]Entry) {
+// sends, so the remote reports a change at once and that pass runs. It
+// returns how many transfers it held back.
+func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action, localPre, localPost, remotePre, remotePost map[string]Entry) int {
 	pushes, pulls := unconfirmedTransfers(actions, localPre, localPost, remotePre, remotePost)
 	for _, p := range append(pushes, pulls...) {
 		fmt.Fprintf(os.Stderr, "sync: base: skipping %s (changed after it was transferred — will re-reconcile)\n", p)
@@ -1158,6 +1232,7 @@ func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action
 			delete(remotePost, p)
 		}
 	}
+	return len(pushes) + len(pulls)
 }
 
 // dropUnstable builds a side's post-pass snapshot for the base. Paths the
@@ -1169,7 +1244,9 @@ func holdBackUnconfirmed(newBase, oldBase map[string]BaseEntry, actions []Action
 // other side and was copied back.) Files created mid-pass are left out until
 // the next pass. Directories always take post, since their mtimes move
 // whenever a child changes. A file under a chmod'd directory is not touched:
-// the chmod changed the directory alone.
+// the chmod changed the directory alone. A chmod'd file takes only its mode
+// from post: the pass did not transfer its content, so an edit or delete made
+// to it meanwhile is kept visible like any other.
 func dropUnstable(pre, post map[string]Entry, touched touchSet) map[string]Entry {
 	set := make(map[string]bool, len(touched.deep))
 	for _, t := range touched.deep {
@@ -1180,9 +1257,6 @@ func dropUnstable(pre, post map[string]Entry, touched touchSet) map[string]Entry
 		shallow[t] = true
 	}
 	isTouched := func(p string) bool {
-		if shallow[p] {
-			return true
-		}
 		for {
 			if set[p] {
 				return true
@@ -1196,9 +1270,13 @@ func dropUnstable(pre, post map[string]Entry, touched touchSet) map[string]Entry
 	}
 	out := make(map[string]Entry, len(post))
 	for p, e := range post {
-		if e.IsDir || isTouched(p) {
+		old, had := pre[p]
+		switch {
+		case e.IsDir || isTouched(p):
 			out[p] = e
-		} else if old, ok := pre[p]; ok && !old.IsDir {
+		case had && !old.IsDir && shallow[p]:
+			out[p] = modeOnly(old, e)
+		case had && !old.IsDir:
 			out[p] = old
 		}
 	}
