@@ -58,6 +58,14 @@ func New(root string, skip func(rel string, isDir bool) bool) (*Watcher, error) 
 			for off := 0; off+unix.SizeofInotifyEvent <= n; {
 				ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
 				nameLen := int(ev.Len)
+				if ev.Mask&unix.IN_IGNORED != 0 {
+					// The kernel retired this watch (directory deleted or
+					// unmounted). Forget it, or the map grows with every
+					// directory that ever existed.
+					mu.Lock()
+					delete(paths, ev.Wd)
+					mu.Unlock()
+				}
 				if ev.Mask&unix.IN_ISDIR != 0 && ev.Mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0 && nameLen > 0 {
 					raw := buf[off+unix.SizeofInotifyEvent : off+unix.SizeofInotifyEvent+nameLen]
 					name := string(raw[:clen(raw)])
