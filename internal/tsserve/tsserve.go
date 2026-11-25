@@ -114,6 +114,21 @@ func (m Mount) URL() string {
 	return "https://" + host + path
 }
 
+// RemoveArgs returns the argv that removes this mount. A mount on a
+// non-default HTTPS port needs --https, otherwise the command would act on the
+// :443 route instead and leave this exposure in place.
+func (m Mount) RemoveArgs() []string {
+	verb := "serve"
+	if m.Funnel {
+		verb = "funnel"
+	}
+	args := []string{verb}
+	if i := strings.LastIndex(m.HostPort, ":"); i >= 0 && m.HostPort[i+1:] != "443" {
+		args = append(args, "--https="+m.HostPort[i+1:])
+	}
+	return append(args, "--set-path="+m.Path, "off")
+}
+
 // Mounts flattens the status into a sorted, stable list.
 func (s *Status) Mounts() []Mount {
 	var out []Mount

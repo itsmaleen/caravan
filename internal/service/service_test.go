@@ -2,10 +2,13 @@ package service
 
 import (
 	"encoding/xml"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"caravan/internal/manifest"
+	"caravan/internal/tsserve"
 )
 
 // ── plist ─────────────────────────────────────────────────────────────────────
@@ -168,5 +171,38 @@ func TestServiceDir_PrefersDirThenWorkspace(t *testing.T) {
 	}
 	if got := m.ServiceDir(manifest.Service{Name: "d", Dir: "sub"}); got != "/root/sub" {
 		t.Errorf("relative dir: %q", got)
+	}
+}
+
+// ── prune output ──────────────────────────────────────────────────────────────
+
+func TestPruneUndeclared_RemovalCommandTargetsMountPort(t *testing.T) {
+	origLoad, origBin := tsLoad, tsBinary
+	t.Cleanup(func() { tsLoad, tsBinary = origLoad, origBin })
+	tsBinary = func() string { return "tailscale" }
+	tsLoad = func() (*tsserve.Status, error) {
+		return &tsserve.Status{
+			Web: map[string]tsserve.WebHost{
+				"h.ts.net:10000": {Handlers: map[string]tsserve.Handler{"/": {Proxy: "http://127.0.0.1:5173"}}},
+			},
+			AllowFunnel: map[string]bool{"h.ts.net:10000": true},
+		}, nil
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	perr := pruneUndeclared(&manifest.Manifest{}, true)
+	w.Close()
+	os.Stdout = origStdout
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	out, _ := io.ReadAll(r)
+	if !strings.Contains(string(out), "tailscale funnel --https=10000 --set-path=/ off") {
+		t.Errorf("removal command must name the mount's port, got:\n%s", out)
 	}
 }

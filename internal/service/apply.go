@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"caravan/internal/cliargs"
 	"caravan/internal/manifest"
@@ -23,6 +24,9 @@ var tsSet = tsserve.Set
 
 // tsLoad is the exposure-reading hook; tests replace it.
 var tsLoad = tsserve.Load
+
+// tsBinary locates the tailscale CLI; tests replace it.
+var tsBinary = tsserve.Binary
 
 func cmdApply(args []string) int {
 	fs := flag.NewFlagSet("service apply", flag.ContinueOnError)
@@ -172,7 +176,7 @@ func pruneUndeclared(m *manifest.Manifest, dryRun bool) error {
 			declared[s.RoutePath()+" "+Target(ports[s.Name])] = true
 		}
 	}
-	bin := tsserve.Binary()
+	bin := tsBinary()
 	if bin == "" {
 		bin = "tailscale"
 	}
@@ -180,12 +184,8 @@ func pruneUndeclared(m *manifest.Manifest, dryRun bool) error {
 		if declared[mt.Path+" "+mt.Proxy] {
 			continue
 		}
-		verb := "serve"
-		if mt.Funnel {
-			verb = "funnel"
-		}
 		fmt.Printf("undeclared: %s %s → %s\n", mt.Visibility(), mt.URL(), mt.Proxy)
-		fmt.Printf("  remove with: %s %s --set-path=%s off\n", bin, verb, mt.Path)
+		fmt.Printf("  remove with: %s %s\n", bin, strings.Join(mt.RemoveArgs(), " "))
 	}
 	return nil
 }

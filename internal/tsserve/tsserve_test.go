@@ -2,6 +2,7 @@ package tsserve
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -169,5 +170,21 @@ func TestLoad_FailureIsNotNothingServed(t *testing.T) {
 	st, err := Load()
 	if err != nil || len(st.Mounts()) != 0 {
 		t.Errorf("no-serve-config failure should be an empty status, got %+v, %v", st, err)
+	}
+}
+
+func TestRemoveArgs_IncludesNonDefaultPort(t *testing.T) {
+	cases := []struct {
+		m    Mount
+		want string
+	}{
+		{Mount{HostPort: "h.ts.net:443", Path: "/", Funnel: true}, "funnel --set-path=/ off"},
+		{Mount{HostPort: "h.ts.net:443", Path: "/app"}, "serve --set-path=/app off"},
+		{Mount{HostPort: "h.ts.net:10000", Path: "/", Funnel: true}, "funnel --https=10000 --set-path=/ off"},
+	}
+	for _, c := range cases {
+		if got := strings.Join(c.m.RemoveArgs(), " "); got != c.want {
+			t.Errorf("RemoveArgs = %q, want %q", got, c.want)
+		}
 	}
 }
