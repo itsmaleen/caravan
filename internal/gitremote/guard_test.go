@@ -35,6 +35,9 @@ func TestDecision(t *testing.T) {
 		{"feature→public allow", "feature/ui", pub, pub, "", false},
 		{"release→public allow", "release/v1", pub, pub, "", false},
 
+		// Nested names and malformed globs fail closed.
+		{"nested private→public block", "private/team/feature", pub, pub, "", true},
+
 		// CARAVAN_PUBLISH matches exact branch → allow.
 		{"publish bypass", "embargo/cve-2026-0001", pub, pub, "embargo/cve-2026-0001", false},
 

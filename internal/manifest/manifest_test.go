@@ -605,3 +605,36 @@ func TestService_RoundTripsThroughTOML(t *testing.T) {
 		t.Errorf("round-trip lost data: %+v", got)
 	}
 }
+
+func TestIsPrivateBranchNestedAndMalformed(t *testing.T) {
+	r := manifest.Repo{
+		Name: "app", URL: "u", PrivateRemote: "private", PrivateURL: "p",
+		PrivateBranches: []string{"private/*", "pri*/*"},
+	}
+	for _, b := range []string{"private/a/b", "private/team/feature", "private/x", "privX/a/b", "main"} {
+		want := b != "main"
+		if got := r.IsPrivateBranch(b); got != want {
+			t.Errorf("IsPrivateBranch(%q) = %v, want %v", b, got, want)
+		}
+	}
+	bad := manifest.Repo{Name: "app", URL: "u", PrivateRemote: "private", PrivateURL: "p", PrivateBranches: []string{"bad/["}}
+	if !bad.IsPrivateBranch("anything/at/all") {
+		t.Error("malformed glob must fail closed (treat branch as private)")
+	}
+	if r.IsPrivateBranch("privateer") {
+		t.Error("privateer must not match private/*")
+	}
+}
+
+func TestValidateMalformedPrivateGlob(t *testing.T) {
+	m := &manifest.Manifest{
+		Version: 1,
+		Repos: []manifest.Repo{{
+			Name: "app", URL: "u", PrivateRemote: "private", PrivateURL: "p",
+			PrivateBranches: []string{"private/["},
+		}},
+	}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("want malformed-glob error, got %v", err)
+	}
+}

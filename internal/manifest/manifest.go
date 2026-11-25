@@ -289,7 +289,10 @@ func (m *Manifest) Validate() error {
 		}
 		if r.RoutingEnabled() {
 			for _, glob := range r.PrivateBranchGlobs() {
-				if matched, _ := path.Match(glob, "main"); matched {
+				if _, err := path.Match(glob, ""); err != nil {
+					return fmt.Errorf("repo %q: private_branches glob %q is malformed: %w", r.Name, glob, err)
+				}
+				if MatchPrivateGlob(glob, "main") {
 					return fmt.Errorf("repo %q: private_branches glob %q would match 'main'", r.Name, glob)
 				}
 			}
@@ -371,11 +374,36 @@ func (r Repo) PrivateBranchGlobs() []string {
 // IsPrivateBranch reports whether name matches any of the repo's private-branch globs.
 func (r Repo) IsPrivateBranch(name string) bool {
 	for _, glob := range r.PrivateBranchGlobs() {
-		if matched, _ := path.Match(glob, name); matched {
+		if MatchPrivateGlob(glob, name) {
 			return true
 		}
 	}
 	return false
+}
+
+// MatchPrivateGlob reports whether branch name matches a private-branch glob.
+// It fails closed: a trailing "/*" covers every nested branch below the
+// prefix (path.Match would stop at the first "/"), and a malformed glob
+// matches everything, so a typo can only make more branches private.
+func MatchPrivateGlob(glob, name string) bool {
+	if prefix, ok := strings.CutSuffix(glob, "/*"); ok {
+		if _, err := path.Match(prefix, ""); err != nil {
+			return true
+		}
+		if strings.HasPrefix(name, prefix+"/") {
+			return true
+		}
+		// A glob prefix such as "pri*" still needs segment-wise matching.
+		parts := strings.Count(prefix, "/") + 1
+		segs := strings.SplitN(name, "/", parts+1)
+		if len(segs) > parts {
+			ok, _ := path.Match(prefix, strings.Join(segs[:parts], "/"))
+			return ok
+		}
+		return false
+	}
+	m, err := path.Match(glob, name)
+	return err != nil || m
 }
 
 // PublicRemoteOr returns the configured public remote name, or "origin" if unset.

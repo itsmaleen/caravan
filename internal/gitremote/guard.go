@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -19,7 +18,7 @@ import (
 func Decision(branch, targetRemote, publicRemote string, globs []string, publishRef string) (block bool, reason string) {
 	isPrivate := false
 	for _, glob := range globs {
-		if matched, _ := path.Match(glob, branch); matched {
+		if manifest.MatchPrivateGlob(glob, branch) {
 			isPrivate = true
 			break
 		}
