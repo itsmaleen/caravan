@@ -378,7 +378,7 @@ func checkSSHRemote(label, host, root string) []result {
 	out = append(out, result{label, "remote reachable", statusOK, host})
 
 	// 2. Remote caravan version.
-	verArgs := append(sshDoctorArgs(), host, "~/.local/bin/caravan version")
+	verArgs := append(sshDoctorArgs(), host, syncengine.RemoteBin()+" version")
 	verOut, verErr := runCmd("ssh", verArgs...)
 	remoteVersion := strings.TrimSpace(string(verOut))
 	remoteVersion = strings.TrimPrefix(remoteVersion, "caravan ")

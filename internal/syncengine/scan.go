@@ -2,6 +2,8 @@
 package syncengine
 
 import (
+	"bufio"
+	"caravan/internal/watch"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -176,16 +179,49 @@ func entriesEqual(a, b map[string]Entry) bool {
 // changed=true) or window elapses (returns the current snapshot with
 // changed=false). It always returns the final entries and whether a change was
 // detected.
-func waitForChange(root string, excludes []string, hashFiles bool, window, poll time.Duration) (map[string]Entry, bool) {
+func waitForChange(root string, excludes []string, hashFiles bool, window, poll time.Duration, since string) (map[string]Entry, bool) {
+	// Start watching before the first scan so nothing between the two is
+	// missed. With native events, sleep until something happens (or a slow safety
+	// tick) instead of walking the tree every poll.
+	var events <-chan struct{}
+	if w, werr := watch.New(root, func(rel string, isDir bool) bool { return matchesExclude(rel, excludes) }); werr == nil {
+		defer w.Close()
+		events = w.C
+		if poll < 2*time.Second {
+			poll = 2 * time.Second
+		}
+	}
+
 	initial, _, err := ScanDir(root, excludes, hashFiles)
 	if err != nil {
 		// Treat scan failure as a change so the caller triggers a sync pass.
 		return initial, true
 	}
+	// since is the digest of the state the caller last synced. If the tree
+	// already differs, report it now: a change made between two long-polls
+	// would otherwise become this poll's baseline and never be reported.
+	if since != "" && EntriesDigest(initial) != since {
+		return initial, true
+	}
+
+	// With native events and a since digest, skip the in-window safety
+	// rescans. Each one walks the whole tree, and with several spokes polling
+	// one hub they were most of the hub's CPU. An event the watcher misses is
+	// still caught within one window: the caller's next poll compares the
+	// tree against since before it waits.
+	trustEvents := events != nil && since != ""
+	if trustEvents {
+		poll = window
+	}
 
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
-		time.Sleep(poll)
+		select {
+		case <-events:
+			watch.Settle(events, 20*time.Millisecond, 500*time.Millisecond)
+		case <-time.After(poll):
+		case <-time.After(time.Until(deadline)):
+		}
 		current, _, err := ScanDir(root, excludes, hashFiles)
 		if err != nil {
 			return current, true
@@ -193,6 +229,9 @@ func waitForChange(root string, excludes []string, hashFiles bool, window, poll 
 		if !entriesEqual(initial, current) {
 			return current, true
 		}
+	}
+	if trustEvents {
+		return initial, false // nothing changed; the caller ignores entries then
 	}
 	// Final scan at window end.
 	final, _, _ := ScanDir(root, excludes, hashFiles)
@@ -213,6 +252,7 @@ func CmdScan(args []string) int {
 	excludeStr := fs.String("exclude", "", "comma-separated exclude patterns")
 	hashFiles := fs.Bool("hash", false, "compute sha256 hash for every regular file")
 	waitStr := fs.String("wait", "", "long-poll for a change for up to this duration (e.g. 20s); only meaningful with --json")
+	since := fs.String("since", "", "with --wait: digest of the caller's last-synced snapshot; report a change at once if the tree differs")
 
 	positionals, err := cliargs.ParseAnywhere(fs, args)
 	if err != nil {
@@ -250,7 +290,7 @@ func CmdScan(args []string) int {
 			return 2
 		}
 		changed := false
-		result, changed = waitForChange(dir, excludes, *hashFiles, window, 250*time.Millisecond)
+		result, changed = waitForChange(dir, excludes, *hashFiles, window, 250*time.Millisecond, *since)
 		if changed {
 			fmt.Fprintln(os.Stderr, "changed=true")
 		} else {
@@ -274,4 +314,69 @@ func CmdScan(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// StatPaths reports the given relative paths under root the way ScanDir would.
+// Paths that are missing or are symlinks are absent from the result. A sync
+// pass uses it to refresh only what it changed, instead of walking the tree.
+func StatPaths(root string, paths []string, hashFiles bool) map[string]Entry {
+	out := make(map[string]Entry, len(paths))
+	for _, rel := range paths {
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		info, err := os.Lstat(abs)
+		if err != nil || info.Mode()&fs.ModeSymlink != 0 {
+			continue
+		}
+		e := Entry{Size: info.Size(), Mtime: info.ModTime().UnixNano(), Mode: uint32(info.Mode()), IsDir: info.IsDir()}
+		if hashFiles && !info.IsDir() {
+			if h, err := hashFile(abs); err == nil {
+				e.Hash = h
+			}
+		}
+		out[rel] = e
+	}
+	return out
+}
+
+// CmdStat implements `caravan stat --json [--hash] DIR`: it reads relative
+// paths from stdin, one per line, and prints their entries as a ScanResult.
+func CmdStat(args []string) int {
+	fs := flag.NewFlagSet("stat", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	jsonOut := fs.Bool("json", false, "output JSON (required)")
+	hashFiles := fs.Bool("hash", false, "compute sha256 for regular files")
+	positionals, err := cliargs.ParseAnywhere(fs, args)
+	if err != nil || !*jsonOut || len(positionals) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: caravan stat --json [--hash] DIR < paths")
+		return 2
+	}
+	var paths []string
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		if p := sc.Text(); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	res := ScanResult{Entries: StatPaths(positionals[0], paths, *hashFiles), Version: buildinfo.Version}
+	if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// EntriesDigest is a stable fingerprint of a snapshot, used by the long-poll
+// to tell whether the remote still matches what the caller last synced.
+func EntriesDigest(m map[string]Entry) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		e := m[k]
+		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%d\x00%t\x00%s\n", k, e.Size, e.Mtime, e.Mode, e.IsDir, e.Hash)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

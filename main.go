@@ -76,6 +76,10 @@ func main() {
 		code = gitremote.CmdPublish(args)
 	case "guard-prepush":
 		code = gitremote.CmdGuardPrepush(args)
+	case "stat":
+		code = syncengine.CmdStat(args)
+	case "move-staging":
+		code = syncengine.CmdMoveStaging(args)
 	case "version", "--version", "-v":
 		fmt.Println("caravan " + buildinfo.Version)
 	case "help", "--help", "-h":
