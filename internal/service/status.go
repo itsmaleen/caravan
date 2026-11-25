@@ -68,19 +68,12 @@ func cmdStatus(args []string) int {
 		return 1
 	}
 
-	// Observed exposure, keyed by upstream port. Absent tailscale is not an
-	// error — it just means we cannot say anything about exposure.
-	observed := map[int]tsserve.Mount{}
-	if st, err := tsLoad(); err == nil {
-		for _, mt := range st.Mounts() {
-			if p := mt.Port(); p != 0 {
-				// Public wins: if any mount for this port is funnelled, the
-				// port is reachable publicly.
-				if prev, ok := observed[p]; !ok || (mt.Funnel && !prev.Funnel) {
-					observed[p] = mt
-				}
-			}
-		}
+	// Observed exposure, keyed by upstream port. A nil map means exposure
+	// could not be read: those rows say "unknown" instead of "private", so
+	// "not exposed" is never confused with "could not check".
+	observed, tsErr := readExposure()
+	if tsErr != nil {
+		fmt.Fprintf(os.Stderr, "service status: cannot read exposure (reported as unknown): %v\n", tsErr)
 	}
 
 	ports := ResolvePorts(m.Services)
@@ -105,7 +98,32 @@ func cmdStatus(args []string) int {
 			return 1
 		}
 	}
+	// Absent tailscale is expected on some hosts; any other failure to read
+	// exposure is not a clean bill of health.
+	if tsErr != nil && !errors.Is(tsErr, tsserve.ErrNoTailscale) {
+		return 1
+	}
 	return 0
+}
+
+// readExposure returns observed mounts keyed by upstream port, or a nil map
+// and the error when tailscale's serve state could not be read.
+func readExposure() (map[int]tsserve.Mount, error) {
+	st, err := tsLoad()
+	if err != nil {
+		return nil, err
+	}
+	observed := map[int]tsserve.Mount{}
+	for _, mt := range st.Mounts() {
+		if p := mt.Port(); p != 0 {
+			// Public wins: if any mount for this port is funnelled, the
+			// port is reachable publicly.
+			if prev, ok := observed[p]; !ok || (mt.Funnel && !prev.Funnel) {
+				observed[p] = mt
+			}
+		}
+	}
+	return observed, nil
 }
 
 func buildRow(s manifest.Service, port int, observed map[int]tsserve.Mount) Row {
@@ -121,6 +139,9 @@ func buildRow(s manifest.Service, port int, observed map[int]tsserve.Mount) Row 
 	}
 	r.Running, r.PID = launchdState(Label(s.Name))
 
+	if observed == nil {
+		r.Observed = "unknown"
+	}
 	if mt, ok := observed[port]; ok {
 		r.Observed = mt.Visibility()
 		r.URL = mt.URL()

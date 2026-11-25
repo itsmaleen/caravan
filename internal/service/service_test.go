@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/xml"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -204,5 +205,34 @@ func TestPruneUndeclared_RemovalCommandTargetsMountPort(t *testing.T) {
 	out, _ := io.ReadAll(r)
 	if !strings.Contains(string(out), "tailscale funnel --https=10000 --set-path=/ off") {
 		t.Errorf("removal command must name the mount's port, got:\n%s", out)
+	}
+}
+
+// ── exposure read failure ─────────────────────────────────────────────────────
+
+func TestReadExposure_FailureIsUnknownNotPrivate(t *testing.T) {
+	orig, origLaunch := tsLoad, launchctlRun
+	t.Cleanup(func() { tsLoad, launchctlRun = orig, origLaunch })
+	launchctlRun = func(...string) ([]byte, error) { return nil, errors.New("not loaded") }
+	boom := errors.New("tailscaled not running")
+	tsLoad = func() (*tsserve.Status, error) { return nil, boom }
+
+	observed, err := readExposure()
+	if !errors.Is(err, boom) || observed != nil {
+		t.Fatalf("want (nil, boom), got (%v, %v)", observed, err)
+	}
+	row := buildRow(manifest.Service{Name: "web", Visibility: manifest.VisTailnet}, 18790, observed)
+	if row.Observed != "unknown" || row.Mismatched {
+		t.Errorf("failed read must report unknown without a mismatch, got %+v", row)
+	}
+
+	tsLoad = func() (*tsserve.Status, error) { return &tsserve.Status{}, nil }
+	observed, err = readExposure()
+	if err != nil || observed == nil {
+		t.Fatalf("successful empty read must be a non-nil map, got (%v, %v)", observed, err)
+	}
+	row = buildRow(manifest.Service{Name: "web", Visibility: manifest.VisTailnet}, 18790, observed)
+	if row.Observed != manifest.VisPrivate {
+		t.Errorf("nothing served is private, got %q", row.Observed)
 	}
 }
