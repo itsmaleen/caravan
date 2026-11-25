@@ -146,8 +146,8 @@ func checkFunnelDevServers(mounts []tsserve.Mount) []result {
 		cmdline := procs[port]
 		if sig := matchDevServer(cmdline); sig != "" {
 			out = append(out, result{"exposure", "funnel → dev server", statusFail, fmt.Sprintf(
-				"%s serves a dev server (%s) — unminified source and fs handlers are public. Run: tailscale funnel --set-path=%s off",
-				mt.URL(), sig, mt.Path)})
+				"%s serves a dev server (%s) — unminified source and fs handlers are public. Run: tailscale %s",
+				mt.URL(), sig, strings.Join(mt.RemoveArgs(), " "))})
 			continue
 		}
 		if cmdline == "" {

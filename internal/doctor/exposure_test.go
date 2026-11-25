@@ -219,3 +219,13 @@ func TestParseLsofFields(t *testing.T) {
 		t.Errorf("names = %v", names)
 	}
 }
+
+func TestExposure_DevServerRemedyNamesNonDefaultPort(t *testing.T) {
+	withStubExposure(t,
+		status([4]string{"h.ts.net:10000", "/", "http://127.0.0.1:5173", "public"}),
+		map[int]string{5173: "node node_modules/.bin/vite --host"})
+	r := find(checkExposure(nil), "dev server")
+	if r == nil || !strings.Contains(r.detail, "tailscale funnel --https=10000 --set-path=/ off") {
+		t.Fatalf("remedy must target the mount's port, got %+v", r)
+	}
+}
