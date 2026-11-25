@@ -277,24 +277,72 @@ func TestApplyOne_RefusesTailnetPublishWhenFunnelOn443(t *testing.T) {
 	m := &manifest.Manifest{Workspace: manifest.Workspace{Root: t.TempDir()}}
 
 	funnelOn("h.ts.net:443")
-	if err := applyOne(m, svc, 18790, false, false); err == nil {
+	if err := applyOne(m, svc, 18790, false); err == nil {
 		t.Fatal("want refusal when Funnel is on for :443")
 	}
 	if published != 0 {
 		t.Errorf("tsSet must not run after a refusal, ran %d times", published)
 	}
 
-	if err := applyOne(m, svc, 18790, false, true); err != nil || published != 1 {
-		t.Errorf("--allow-public should proceed: err=%v published=%d", err, published)
-	}
-
 	funnelOn("h.ts.net:10000") // other port: serve on :443 is not widened
-	if err := applyOne(m, svc, 18790, false, false); err != nil {
+	if err := applyOne(m, svc, 18790, false); err != nil {
 		t.Errorf("funnel on another port must not block: %v", err)
+	}
+	if published != 1 {
+		t.Errorf("published %d times, want 1", published)
 	}
 
 	tsLoad = func() (*tsserve.Status, error) { return nil, errors.New("access denied") }
-	if err := applyOne(m, svc, 18790, false, false); err == nil {
+	if err := applyOne(m, svc, 18790, false); err == nil {
 		t.Error("unreadable serve state must fail closed")
+	}
+}
+
+// Turning Funnel on publishes every route on that port, so a public service
+// must not be applied while :443 carries a route no public service declares.
+func TestApplyOne_RefusesFunnelOverUndeclaredTailnetRoute(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	origLoad, origSet, origLaunch := tsLoad, tsSet, launchctlRun
+	t.Cleanup(func() { tsLoad, tsSet, launchctlRun = origLoad, origSet, origLaunch })
+	launchctlRun = func(...string) ([]byte, error) { return nil, nil }
+	published := 0
+	tsSet = func(vis, path, target string) error { published++; return nil }
+	serving := func(hostPort, route string, funnel bool) {
+		tsLoad = func() (*tsserve.Status, error) {
+			st, err := tsserve.ParseStatus([]byte(`{"Web":{"` + hostPort + `":{"Handlers":{"` + route + `":{"Proxy":"http://127.0.0.1:9000"}}}}}`))
+			if err == nil && funnel {
+				st.AllowFunnel = map[string]bool{hostPort: true}
+			}
+			return st, err
+		}
+	}
+	blog := manifest.Service{Name: "blog", Command: "x", Port: "18791", Visibility: manifest.VisPublic, Route: "/blog"}
+	m := &manifest.Manifest{Workspace: manifest.Workspace{Root: t.TempDir()}, Services: []manifest.Service{blog}}
+
+	serving("h.ts.net:443", "/admin", false)
+	if err := applyOne(m, blog, 18791, false); err == nil {
+		t.Fatal("want refusal: Funnel on :443 would publish the tailnet /admin route")
+	}
+	if published != 0 {
+		t.Errorf("tsSet ran %d times after a refusal", published)
+	}
+
+	tsLoad = func() (*tsserve.Status, error) { return nil, errors.New("access denied") }
+	if err := applyOne(m, blog, 18791, false); err == nil {
+		t.Error("unreadable serve state must fail closed")
+	}
+
+	for _, ok := range []struct {
+		name, hostPort, route string
+		funnel                bool
+	}{
+		{"its own route, re-applied", "h.ts.net:443", "/blog", false},
+		{"a route on another port", "h.ts.net:8443", "/admin", false},
+		{"a route that is already public", "h.ts.net:443", "/other", true},
+	} {
+		serving(ok.hostPort, ok.route, ok.funnel)
+		if err := applyOne(m, blog, 18791, false); err != nil {
+			t.Errorf("%s must not block: %v", ok.name, err)
+		}
 	}
 }

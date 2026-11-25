@@ -16,5 +16,5 @@ package buildinfo
 // 0.8.4: a pass that left work unfinished is retried on a timer; a failed
 // delete is retried, not undone; a chmod refreshes the mode only.
 // 0.9.0: [[service]] blocks (supervised services published with tailscale
-// serve), exposure checks in doctor, and split-remote git routing.
+// serve) and exposure checks in doctor.
 const Version = "0.9.0"

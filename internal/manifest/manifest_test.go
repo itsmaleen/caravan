@@ -660,3 +660,24 @@ func TestValidateServiceWorkspaceMustExist(t *testing.T) {
 		t.Fatalf("explicit dir should bypass workspace check: %v", err)
 	}
 }
+
+// Funnel is per port and both visibilities publish on :443, so a manifest
+// that mixes them would put the tailnet service on the open internet.
+func TestValidateRejectsMixedPublicAndTailnetServices(t *testing.T) {
+	svc := func(name, vis, port string) manifest.Service {
+		return manifest.Service{Name: name, Command: "x", Port: port, Visibility: vis}
+	}
+	mixed := &manifest.Manifest{Services: []manifest.Service{svc("web", manifest.VisTailnet, "3000"), svc("blog", manifest.VisPublic, "3001")}}
+	if err := mixed.Validate(); err == nil {
+		t.Error("public + tailnet services validated")
+	}
+	for _, ok := range [][]manifest.Service{
+		{svc("web", manifest.VisTailnet, "3000"), svc("api", manifest.VisTailnet, "3001")},
+		{svc("blog", manifest.VisPublic, "3000"), svc("docs", manifest.VisPublic, "3001")},
+		{svc("blog", manifest.VisPublic, "3000"), svc("worker", manifest.VisPrivate, "")},
+	} {
+		if err := (&manifest.Manifest{Services: ok}).Validate(); err != nil {
+			t.Errorf("%v: %v", ok, err)
+		}
+	}
+}

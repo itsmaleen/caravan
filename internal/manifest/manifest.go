@@ -308,6 +308,7 @@ func (m *Manifest) Validate() error {
 		seen["sync:"+s.Name] = true
 	}
 	ports := map[int]string{}
+	firstTailnet, firstPublic := "", ""
 	for _, s := range m.Services {
 		if s.Name == "" || s.Command == "" {
 			return fmt.Errorf("service entries need name and command (got name=%q)", s.Name)
@@ -338,6 +339,16 @@ func (m *Manifest) Validate() error {
 		if s.Route != "" && !strings.HasPrefix(s.Route, "/") {
 			return fmt.Errorf("service %q: route %q must start with /", s.Name, s.Route)
 		}
+		switch s.Vis() {
+		case VisTailnet:
+			if firstTailnet == "" {
+				firstTailnet = s.Name
+			}
+		case VisPublic:
+			if firstPublic == "" {
+				firstPublic = s.Name
+			}
+		}
 		if s.Workspace != "" && s.Dir == "" {
 			found := false
 			for _, sy := range m.Sync {
@@ -355,6 +366,12 @@ func (m *Manifest) Validate() error {
 				return fmt.Errorf("service %q: %w", s.Name, err)
 			}
 		}
+	}
+	// Both visibilities publish on :443, and Tailscale turns Funnel on per
+	// host:port, not per path. One public service would put every tailnet
+	// service on the open internet.
+	if firstTailnet != "" && firstPublic != "" {
+		return fmt.Errorf("service %q is public and service %q is tailnet: Funnel is enabled per port, so both would be public. Make them the same visibility, or run them on separate machines", firstPublic, firstTailnet)
 	}
 	return nil
 }

@@ -214,11 +214,12 @@ caravan service rm NAME
 | `tailnet` | `tailscale serve` | your tailnet | **yes** — `Tailscale-User-Login` |
 | `public` | `tailscale funnel` | the open internet | **no** |
 
-Three rules, all of them about never widening exposure by accident:
+Four rules, all of them about never widening exposure by accident:
 
 1. **An omitted `visibility` means `private`.** A field you forgot must never open a door.
 2. **`public` requires `--allow-public` on every apply.** A funnel is a decision, not a default.
 3. **`apply` never tears down exposure.** `--prune` prints the exact removal command and stops; nothing that could break someone else's link happens behind your back.
+4. **`public` and `tailnet` services do not share a machine.** Both publish on port 443 and Tailscale turns Funnel on per port, not per path, so one public service would publish every tailnet route beside it. The manifest is rejected if it mixes them, and `apply` refuses to add a tailnet route to a funnelled port or to turn Funnel on over a route no public service declares.
 
 ### `caravan doctor` exposure checks
 

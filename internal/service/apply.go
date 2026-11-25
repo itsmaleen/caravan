@@ -92,7 +92,7 @@ func cmdApply(args []string) int {
 	ports := ResolvePorts(m.Services)
 	code := 0
 	for _, s := range services {
-		if err := applyOne(m, s, ports[s.Name], *dryRun, *allowPublic); err != nil {
+		if err := applyOne(m, s, ports[s.Name], *dryRun); err != nil {
 			fmt.Fprintf(os.Stderr, "service apply %s: %v\n", s.Name, err)
 			code = 1
 		}
@@ -107,7 +107,7 @@ func cmdApply(args []string) int {
 	return code
 }
 
-func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun, allowPublic bool) error {
+func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun bool) error {
 	label := Label(s.Name)
 	plistPath := PlistPath(s.Name)
 	logPath := LogPath(s.Name)
@@ -127,11 +127,18 @@ func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun, allowP
 		return nil
 	}
 
-	// Funnel is keyed on host:port, not path. `tailscale serve` publishes on
-	// :443, so if Funnel is already on for that port the new tailnet route
-	// would be public the moment it lands. Check before starting anything.
-	if s.Vis() == manifest.VisTailnet && !allowPublic {
+	// Funnel is keyed on host:port, not path, and both visibilities publish
+	// on :443. So a tailnet route is public the moment it lands on a funnelled
+	// port, and turning Funnel on makes every route already there public.
+	// Check before starting anything. --allow-public is consent for the
+	// services declared public, never for these.
+	switch s.Vis() {
+	case manifest.VisTailnet:
 		if err := checkNoFunnelOn443(); err != nil {
+			return err
+		}
+	case manifest.VisPublic:
+		if err := checkNoTailnetRoutesOn443(m); err != nil {
 			return err
 		}
 	}
@@ -176,11 +183,37 @@ func checkNoFunnelOn443() error {
 		if errors.Is(err, tsserve.ErrNoTailscale) {
 			return nil // tsSet will report the missing CLI
 		}
-		return fmt.Errorf("cannot verify Funnel state before publishing: %w (re-run with --allow-public to skip the check)", err)
+		return fmt.Errorf("cannot verify Funnel state before publishing: %w", err)
 	}
 	for hostPort, on := range st.AllowFunnel {
 		if on && strings.HasSuffix(hostPort, ":443") {
-			return fmt.Errorf("Funnel is already enabled on %s; a tailnet route there would be public. Disable it or re-run with --allow-public", hostPort)
+			return fmt.Errorf("Funnel is already enabled on %s; a tailnet route there would be public. Turn Funnel off there, or declare the service public", hostPort)
+		}
+	}
+	return nil
+}
+
+// checkNoTailnetRoutesOn443 refuses to turn Funnel on while :443 carries a
+// route that no public service declares: Funnel would publish that route too.
+// It fails closed when the serve state cannot be read.
+func checkNoTailnetRoutesOn443(m *manifest.Manifest) error {
+	st, err := tsLoad()
+	if err != nil {
+		if errors.Is(err, tsserve.ErrNoTailscale) {
+			return nil // tsSet will report the missing CLI
+		}
+		return fmt.Errorf("cannot verify what Funnel would expose: %w", err)
+	}
+	public := map[string]bool{}
+	for _, s := range m.Services {
+		if s.Vis() == manifest.VisPublic {
+			public[s.RoutePath()] = true
+		}
+	}
+	for _, mt := range st.Mounts() {
+		if strings.HasSuffix(mt.HostPort, ":443") && !mt.Funnel && !public[mt.Path] {
+			return fmt.Errorf("Funnel on :443 would also publish %s → %s, which no public service declares. Remove that route first: tailscale %s",
+				mt.URL(), mt.Proxy, strings.Join(mt.RemoveArgs(), " "))
 		}
 	}
 	return nil
