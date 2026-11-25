@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -234,5 +235,25 @@ func TestReadExposure_FailureIsUnknownNotPrivate(t *testing.T) {
 	row = buildRow(manifest.Service{Name: "web", Visibility: manifest.VisTailnet}, 18790, observed)
 	if row.Observed != manifest.VisPrivate {
 		t.Errorf("nothing served is private, got %q", row.Observed)
+	}
+}
+
+// ── logs ──────────────────────────────────────────────────────────────────────
+
+func TestCmdLogs_RejectsNonPositiveLines(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(LogPath("web")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(LogPath("web"), []byte("a\nb\nc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"-1", "0"} {
+		if code := cmdLogs([]string{"web", "--lines", n}); code != 2 {
+			t.Errorf("--lines %s: exit %d, want 2", n, code)
+		}
+	}
+	if code := cmdLogs([]string{"web", "--lines", "2"}); code != 0 {
+		t.Errorf("--lines 2: exit %d, want 0", code)
 	}
 }

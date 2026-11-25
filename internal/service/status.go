@@ -287,6 +287,10 @@ func cmdLogs(args []string) int {
 		fmt.Fprintln(os.Stderr, "service logs: need a service name")
 		return 2
 	}
+	if *lines < 1 {
+		fmt.Fprintln(os.Stderr, "service logs: --lines must be at least 1")
+		return 2
+	}
 	path := LogPath(positionals[0])
 	data, err := os.ReadFile(path)
 	if err != nil {
