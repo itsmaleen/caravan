@@ -211,6 +211,9 @@ func TestCopyFile_Atomic_ModePreserved(t *testing.T) {
 	if err := os.WriteFile(src, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
+	if err := os.Chmod(src, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
 	// dst exists with a different mode.
 	if err := os.WriteFile(dst, []byte("old"), 0o600); err != nil {
 		t.Fatalf("write dst: %v", err)
