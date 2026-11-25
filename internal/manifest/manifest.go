@@ -338,6 +338,18 @@ func (m *Manifest) Validate() error {
 		if s.Route != "" && !strings.HasPrefix(s.Route, "/") {
 			return fmt.Errorf("service %q: route %q must start with /", s.Name, s.Route)
 		}
+		if s.Workspace != "" && s.Dir == "" {
+			found := false
+			for _, sy := range m.Sync {
+				found = found || sy.Name == s.Workspace
+			}
+			for _, r := range m.Repos {
+				found = found || r.Name == s.Workspace
+			}
+			if !found {
+				return fmt.Errorf("service %q: workspace %q matches no [[sync]] or [[repos]] name", s.Name, s.Workspace)
+			}
+		}
 		if s.Health != "" {
 			if _, _, _, err := ParseHealth(s.Health); err != nil {
 				return fmt.Errorf("service %q: %w", s.Name, err)

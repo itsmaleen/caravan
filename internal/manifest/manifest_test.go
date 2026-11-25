@@ -584,6 +584,7 @@ func TestService_RoundTripsThroughTOML(t *testing.T) {
 	in := &manifest.Manifest{
 		Version:   1,
 		Workspace: manifest.Workspace{Root: "~/code"},
+		Sync:      []manifest.Sync{{Name: "wrinkles", Local: "wrinkles", Remote: "host:wrinkles"}},
 		Services: []manifest.Service{{
 			Name: "wrinkles-hub", Workspace: "wrinkles",
 			Command: "python3 -m http.server {{port}} --directory ./output",
@@ -636,5 +637,26 @@ func TestValidateMalformedPrivateGlob(t *testing.T) {
 	}
 	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "malformed") {
 		t.Fatalf("want malformed-glob error, got %v", err)
+	}
+}
+
+func TestValidateServiceWorkspaceMustExist(t *testing.T) {
+	svc := manifest.Service{Name: "web", Command: "x", Workspace: "typo"}
+	m := &manifest.Manifest{
+		Version:  1,
+		Sync:     []manifest.Sync{{Name: "site", Local: "a", Remote: "b"}},
+		Services: []manifest.Service{svc},
+	}
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "workspace") {
+		t.Fatalf("want workspace error, got %v", err)
+	}
+	m.Services[0].Workspace = "site"
+	if err := m.Validate(); err != nil {
+		t.Fatalf("known workspace rejected: %v", err)
+	}
+	m.Services[0].Workspace = "typo"
+	m.Services[0].Dir = "/srv/x"
+	if err := m.Validate(); err != nil {
+		t.Fatalf("explicit dir should bypass workspace check: %v", err)
 	}
 }
