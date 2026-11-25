@@ -10,6 +10,7 @@ import (
 	"caravan/internal/manifest"
 	"caravan/internal/provision"
 	"caravan/internal/secrets"
+	"caravan/internal/service"
 	"caravan/internal/setup"
 	"caravan/internal/syncengine"
 )
@@ -26,6 +27,8 @@ Usage:
                                                         bidirectional folder sync (ssh or local:)
   caravan daemon <install|uninstall|status> [NAME] [--interval 5s] [-f MANIFEST]
                                                         run sync continuously via launchd (macOS)
+  caravan service <apply|status|logs|rm> [NAME] [--dry-run] [--prune] [--allow-public] [-f MANIFEST]
+                                                        supervise services + publish them at their declared visibility
   caravan setup [--agent NAME] [--headless] [--print-prompt] [-f MANIFEST]
                                                         agent-powered interactive setup wizard
   caravan scan --json DIR [--exclude a,b]               (internal) emit dir state as JSON
@@ -53,6 +56,8 @@ func main() {
 		code = syncengine.CmdSync(args)
 	case "daemon":
 		code = syncengine.CmdDaemon(args)
+	case "service":
+		code = service.CmdService(args)
 	case "doctor":
 		code = doctor.CmdDoctor(args)
 	case "setup":

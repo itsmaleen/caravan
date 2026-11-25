@@ -15,4 +15,6 @@ package buildinfo
 // in-window safety rescans (most of the hub's CPU with several spokes).
 // 0.8.4: a pass that left work unfinished is retried on a timer; a failed
 // delete is retried, not undone; a chmod refreshes the mode only.
-const Version = "0.8.4"
+// 0.9.0: [[service]] blocks (supervised services published with tailscale
+// serve) and exposure checks in doctor.
+const Version = "0.9.0"
