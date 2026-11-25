@@ -257,3 +257,44 @@ func TestCmdLogs_RejectsNonPositiveLines(t *testing.T) {
 		t.Errorf("--lines 2: exit %d, want 0", code)
 	}
 }
+
+// ── funnel check before serve publication ─────────────────────────────────────
+
+func TestApplyOne_RefusesTailnetPublishWhenFunnelOn443(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	origLoad, origSet, origLaunch := tsLoad, tsSet, launchctlRun
+	t.Cleanup(func() { tsLoad, tsSet, launchctlRun = origLoad, origSet, origLaunch })
+	launchctlRun = func(...string) ([]byte, error) { return nil, nil }
+	published := 0
+	tsSet = func(vis, path, target string) error { published++; return nil }
+
+	funnelOn := func(hostPort string) {
+		tsLoad = func() (*tsserve.Status, error) {
+			return &tsserve.Status{AllowFunnel: map[string]bool{hostPort: true}}, nil
+		}
+	}
+	svc := manifest.Service{Name: "web", Command: "x", Port: "18790", Visibility: manifest.VisTailnet}
+	m := &manifest.Manifest{Workspace: manifest.Workspace{Root: t.TempDir()}}
+
+	funnelOn("h.ts.net:443")
+	if err := applyOne(m, svc, 18790, false, false); err == nil {
+		t.Fatal("want refusal when Funnel is on for :443")
+	}
+	if published != 0 {
+		t.Errorf("tsSet must not run after a refusal, ran %d times", published)
+	}
+
+	if err := applyOne(m, svc, 18790, false, true); err != nil || published != 1 {
+		t.Errorf("--allow-public should proceed: err=%v published=%d", err, published)
+	}
+
+	funnelOn("h.ts.net:10000") // other port: serve on :443 is not widened
+	if err := applyOne(m, svc, 18790, false, false); err != nil {
+		t.Errorf("funnel on another port must not block: %v", err)
+	}
+
+	tsLoad = func() (*tsserve.Status, error) { return nil, errors.New("access denied") }
+	if err := applyOne(m, svc, 18790, false, false); err == nil {
+		t.Error("unreadable serve state must fail closed")
+	}
+}

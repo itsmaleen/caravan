@@ -92,7 +92,7 @@ func cmdApply(args []string) int {
 	ports := ResolvePorts(m.Services)
 	code := 0
 	for _, s := range services {
-		if err := applyOne(m, s, ports[s.Name], *dryRun); err != nil {
+		if err := applyOne(m, s, ports[s.Name], *dryRun, *allowPublic); err != nil {
 			fmt.Fprintf(os.Stderr, "service apply %s: %v\n", s.Name, err)
 			code = 1
 		}
@@ -107,7 +107,7 @@ func cmdApply(args []string) int {
 	return code
 }
 
-func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun bool) error {
+func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun, allowPublic bool) error {
 	label := Label(s.Name)
 	plistPath := PlistPath(s.Name)
 	logPath := LogPath(s.Name)
@@ -125,6 +125,15 @@ func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun bool) e
 			fmt.Printf("would expose nothing (visibility=private)\n")
 		}
 		return nil
+	}
+
+	// Funnel is keyed on host:port, not path. `tailscale serve` publishes on
+	// :443, so if Funnel is already on for that port the new tailnet route
+	// would be public the moment it lands. Check before starting anything.
+	if s.Vis() == manifest.VisTailnet && !allowPublic {
+		if err := checkNoFunnelOn443(); err != nil {
+			return err
+		}
 	}
 
 	if err := os.MkdirAll(filepathDir(logPath), 0o755); err != nil {
@@ -155,6 +164,25 @@ func applyOne(m *manifest.Manifest, s manifest.Service, port int, dryRun bool) e
 		return fmt.Errorf("publish: %w", err)
 	}
 	fmt.Printf("service: %s published %s at %s\n", s.Name, s.Vis(), s.RoutePath())
+	return nil
+}
+
+// checkNoFunnelOn443 refuses to publish a tailnet-only route while any host's
+// :443 has Funnel enabled. It fails closed: if the serve state cannot be read,
+// the exposure cannot be shown to be safe.
+func checkNoFunnelOn443() error {
+	st, err := tsLoad()
+	if err != nil {
+		if errors.Is(err, tsserve.ErrNoTailscale) {
+			return nil // tsSet will report the missing CLI
+		}
+		return fmt.Errorf("cannot verify Funnel state before publishing: %w (re-run with --allow-public to skip the check)", err)
+	}
+	for hostPort, on := range st.AllowFunnel {
+		if on && strings.HasSuffix(hostPort, ":443") {
+			return fmt.Errorf("Funnel is already enabled on %s; a tailnet route there would be public. Disable it or re-run with --allow-public", hostPort)
+		}
+	}
 	return nil
 }
 
