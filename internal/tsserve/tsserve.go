@@ -139,9 +139,15 @@ func (s *Status) Mounts() []Mount {
 // ParseStatus decodes `tailscale serve status --json` output.
 func ParseStatus(data []byte) (*Status, error) {
 	trimmed := strings.TrimSpace(string(data))
-	// A node with nothing served prints a human string rather than JSON.
-	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+	// A node with nothing served prints a human string rather than JSON. Only
+	// that known message means "nothing served"; any other non-JSON output
+	// (tailscaled down, access denied, logged out) is an error, because
+	// reading it as empty would make exposure checks pass blind.
+	if trimmed == "" || isNoServeConfig(trimmed) {
 		return &Status{}, nil
+	}
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, fmt.Errorf("tailscale serve status: unexpected output: %s", trimmed)
 	}
 	var st Status
 	if err := json.Unmarshal([]byte(trimmed), &st); err != nil {
@@ -159,13 +165,19 @@ func Load() (*Status, error) {
 	}
 	out, err := runCmd(bin, "serve", "status", "--json")
 	if err != nil {
-		// `serve status` exits non-zero when nothing is configured.
-		if st, perr := ParseStatus(out); perr == nil {
-			return st, nil
+		// `serve status` may exit non-zero when nothing is configured; accept
+		// only that known message, never an empty or unrecognised failure.
+		if isNoServeConfig(strings.TrimSpace(string(out))) {
+			return &Status{}, nil
 		}
-		return nil, fmt.Errorf("tailscale serve status: %w", err)
+		return nil, fmt.Errorf("tailscale serve status: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return ParseStatus(out)
+}
+
+// isNoServeConfig reports whether s is tailscale's "nothing served" message.
+func isNoServeConfig(s string) bool {
+	return strings.Contains(strings.ToLower(s), "no serve config")
 }
 
 // ErrNoTailscale is returned when no tailscale CLI can be found.

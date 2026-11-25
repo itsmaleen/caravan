@@ -1,6 +1,9 @@
 package tsserve
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // realStatus is verbatim `tailscale serve status --json` output captured from a
 // real machine on 2026-07-29. Using the real shape as the fixture is the point:
@@ -131,5 +134,40 @@ func TestSetArgs_FunnelOnlyForPublic(t *testing.T) {
 		if tn[i] != want[i] {
 			t.Fatalf("SetArgs = %v, want %v", tn, want)
 		}
+	}
+}
+
+func TestParseStatus_UnknownNonJSONIsError(t *testing.T) {
+	for _, out := range []string{"Tailscale is stopped.", "Access denied: serve config denied", "Logged out."} {
+		if _, err := ParseStatus([]byte(out)); err == nil {
+			t.Errorf("ParseStatus(%q): want error, got nil", out)
+		}
+	}
+}
+
+func TestLoad_FailureIsNotNothingServed(t *testing.T) {
+	orig := runCmd
+	t.Cleanup(func() { runCmd = orig })
+	stub := func(serveOut string, serveErr error) {
+		runCmd = func(name string, args ...string) ([]byte, error) {
+			if len(args) > 0 && args[0] == "version" {
+				return []byte("1.0"), nil
+			}
+			return []byte(serveOut), serveErr
+		}
+	}
+	fail := errors.New("exit status 1")
+
+	for _, out := range []string{"failed to connect to local tailscaled", "Access denied", ""} {
+		stub(out, fail)
+		if st, err := Load(); err == nil {
+			t.Errorf("Load with failing status %q: want error, got %+v", out, st)
+		}
+	}
+
+	stub("No serve config\n", fail)
+	st, err := Load()
+	if err != nil || len(st.Mounts()) != 0 {
+		t.Errorf("no-serve-config failure should be an empty status, got %+v, %v", st, err)
 	}
 }
