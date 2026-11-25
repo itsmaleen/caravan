@@ -23,6 +23,10 @@ func seedFile(t *testing.T, root, rel, content string, mtime time.Time) {
 	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 		t.Fatalf("seedFile write: %v", err)
 	}
+	// WriteFile's mode is narrowed by the umask; tests assert exact modes.
+	if err := os.Chmod(full, 0o644); err != nil {
+		t.Fatalf("seedFile chmod: %v", err)
+	}
 	if err := os.Chtimes(full, mtime, mtime); err != nil {
 		t.Fatalf("seedFile chtimes: %v", err)
 	}
@@ -940,6 +944,9 @@ func TestCopyFile_OverwritePreservesMode(t *testing.T) {
 	if err := os.WriteFile(src, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
+	if err := os.Chmod(src, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
 	// Write destination with 0644 (different).
 	if err := os.WriteFile(dst, []byte("old"), 0o644); err != nil {
 		t.Fatalf("write dst: %v", err)
@@ -1176,6 +1183,9 @@ func TestIntegration_AtomicCopy_MultiFileSync(t *testing.T) {
 	seedFile(t, sideA, "readme.txt", "readme", t1())
 	if err := os.WriteFile(filepath.Join(sideA, "script.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(sideA, "script.sh"), 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
 	}
 	if err := os.Chtimes(filepath.Join(sideA, "script.sh"), t1(), t1()); err != nil {
 		t.Fatalf("chtimes: %v", err)
