@@ -3,6 +3,7 @@ package doctor
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -27,11 +28,16 @@ var listeners = defaultListeners
 // serve unminified source and expose filesystem handlers; none of them belong
 // on a public funnel.
 var devServerSignatures = []string{
-	"vite", "next dev", "nuxt dev", "webpack-dev-server", "webpack serve",
+	"next dev", "nuxt dev", "webpack-dev-server", "webpack serve",
 	"ng serve", "react-scripts start", "remix dev", "astro dev", "svelte-kit dev",
-	"rails server", "flask run", "manage.py runserver", "php -S",
-	"--watch-poll", "hmr",
+	"rails server", "flask run", "manage.py runserver", "php -s",
+	"--watch-poll",
 }
+
+// devServerTokens are short names that are only a signature as a whole word:
+// "vite" must not match "/srv/invite-app/server". A token counts when it is
+// preceded by a separator and followed by a separator, dot or end of line.
+var devServerTokens = regexp.MustCompile(`(^|[\s/=-])(vite|hmr)($|[\s/.])`)
 
 // devServerBodyMarkers are HMR client markers served by dev servers. Used only
 // when the process table is unavailable (remote or restricted environments).
@@ -178,6 +184,9 @@ func matchDevServer(cmdline string) string {
 		if strings.Contains(lower, sig) {
 			return sig
 		}
+	}
+	if m := devServerTokens.FindStringSubmatch(lower); m != nil {
+		return m[2]
 	}
 	// `--host` alone is ambiguous, but `--host` on a node process in a
 	// node_modules/.bin path is a dev server nearly every time.

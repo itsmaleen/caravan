@@ -156,6 +156,10 @@ func TestMatchDevServer(t *testing.T) {
 		"npm run dev -- next dev -p 3000":                   true,
 		"node /x/node_modules/.bin/astro dev":               true,
 		"python3 -m flask run":                              true,
+		"php -S 127.0.0.1:8000":                             true,
+		"node /x/vite/bin/vite.js":                          true,
+		"/srv/invite-app/server":                            false,
+		"/usr/bin/invited --serve":                          false,
 		"node /x/node_modules/.bin/serve --host build":      true, // --host + node_modules/.bin
 		"python3 -m http.server 18790 --bind 127.0.0.1":     false,
 		"/usr/local/bin/caddy run":                          false,
