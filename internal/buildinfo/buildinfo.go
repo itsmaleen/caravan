@@ -13,4 +13,7 @@ package buildinfo
 // SIGKILLs a binary overwritten in place); re-install on exit 126/137.
 // 0.8.3: a long-poll with native events and a since digest skips its
 // in-window safety rescans (most of the hub's CPU with several spokes).
-const Version = "0.8.3"
+// 0.8.4: a file saved again between a pass's scan and its transfer is
+// recorded as synced instead of replayed as a conflict on the next pass
+// (one hub backup per editor autosave); identical copies are never conflicts.
+const Version = "0.8.4"

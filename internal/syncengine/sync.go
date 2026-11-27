@@ -486,7 +486,14 @@ func syncPass(s manifest.Sync, dryRun, quiet bool) (map[string]Entry, map[string
 	// changing it: its new content was never transferred, so recording it as
 	// in sync would hide the edit forever (the size guard in buildBase only
 	// catches edits that change the size).
-	newBase := buildBase(dropUnstable(localEntries, newLocal, touchedL), newRemote)
+	localForBase := dropUnstable(localEntries, newLocal, touchedL)
+	// A source saved again between the scan and the transfer: tar sent the
+	// newer bytes, so both sides now hold the same file but the snapshot the
+	// pass planned from is stale. Record what actually landed, or the next
+	// pass takes its own transfer for an edit on the far side and backs it up
+	// as a conflict loser, once per save.
+	settleTransfers(actions, localForBase, newLocal, remoteEntries, newRemote, remote, s.Checksum)
+	newBase := buildBase(localForBase, newRemote)
 	// A transferred file that no longer looks like what the transfer put
 	// there was edited between placement and the re-read (or never landed).
 	// Don't record it as synced.
@@ -1165,6 +1172,88 @@ func touchedPaths(actions []Action) (local, remote touchSet) {
 	return local, remote
 }
 
+// settleTransfers fixes up the post-pass snapshots for files whose source
+// changed between the scan and the transfer. tar reads a file when it sends
+// it, not when the pass scanned it, so a file saved again in that window
+// lands on the destination newer than the planned entry says.
+//
+// Push: if the local file as it is now is exactly what landed on the remote,
+// that is the synced version, so the local half of the base takes it
+// (localForBase is updated in place).
+//
+// Pull: the remote copy is not re-read after a pull, so when the local result
+// is not the planned remote entry, the pulled paths are stat'd. If the remote
+// file as it is now is exactly what landed locally, remotePost takes it.
+//
+// Anything else (the destination matches neither version of the source) is
+// left alone: something really did write the far side, and the next pass must
+// see it.
+func settleTransfers(actions []Action, localForBase, localPost, remotePre, remotePost map[string]Entry, remote *RemoteConn, hash bool) {
+	var recheck []string
+	for _, a := range actions {
+		switch a.Op {
+		case OpPush:
+			l, okL := localPost[a.Path]
+			r, okR := remotePost[a.Path]
+			if !okL || !okR || l.IsDir || r.IsDir {
+				continue
+			}
+			if installed(l, r) {
+				localForBase[a.Path] = l
+			} else if intermediate(localForBase[a.Path], l, r) {
+				// Saved twice during the pass: tar sent the save in between.
+				// That is the synced version; the newest save is a plain edit.
+				landed := r
+				landed.Mode = l.Mode
+				localForBase[a.Path] = landed
+			}
+		case OpPull:
+			l, okL := localPost[a.Path]
+			pre, okP := remotePre[a.Path]
+			if okL && !l.IsDir && (!okP || !installed(pre, l)) {
+				recheck = append(recheck, a.Path)
+			}
+		}
+	}
+	if len(recheck) == 0 || remote == nil {
+		return
+	}
+	fresh, err := remote.Stat(recheck, hash)
+	if err != nil {
+		return // keep the planned entries: the worst case is the old behaviour
+	}
+	for _, p := range recheck {
+		r, ok := fresh[p]
+		if !ok || r.IsDir {
+			continue
+		}
+		l := localPost[p]
+		switch {
+		case installed(r, l):
+			remotePost[p] = r
+		case intermediate(remotePre[p], r, l):
+			// The remote was saved more than once during the pull and tar
+			// fetched one of the saves in between: that is the synced
+			// version, and the remote's newest save is a plain edit.
+			landed := l
+			landed.Mode = r.Mode
+			remotePost[p] = landed
+		}
+	}
+}
+
+// intermediate reports whether dst is a copy of a version the source passed
+// through during the pass: the source changed (post is newer than pre) and
+// dst carries an mtime inside that window. Transfers preserve mtime, so only
+// a save made on the source side between scan and re-read lands there. A
+// second of slack below pre covers tar dropping the sub-second part.
+func intermediate(pre, post, dst Entry) bool {
+	if pre.IsDir || post.IsDir || dst.IsDir || pre.Mtime == 0 || post.Mtime <= pre.Mtime {
+		return false
+	}
+	return dst.Mtime > pre.Mtime-int64(time.Second) && dst.Mtime <= post.Mtime
+}
+
 // installed reports whether dst still looks like the copy of src a transfer
 // would have left: the same hash when both carry one, otherwise the same size
 // and src's mtime. tar and older rsyncs drop the sub-second part of the mtime,
@@ -1197,7 +1286,7 @@ func unconfirmedTransfers(actions []Action, localPre, localPost, remotePre, remo
 	for _, a := range actions {
 		switch a.Op {
 		case OpPush:
-			if dst, ok := remotePost[a.Path]; ok && !matches(a.Path, dst, localPre, localPost) {
+			if dst, ok := remotePost[a.Path]; ok && !matches(a.Path, dst, localPre, localPost) && !intermediate(localPre[a.Path], localPost[a.Path], dst) {
 				pushes = append(pushes, a.Path)
 			}
 		case OpPull:

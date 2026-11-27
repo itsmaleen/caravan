@@ -3,6 +3,7 @@ package syncengine
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // Op is the type of a sync action.
@@ -170,6 +171,12 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 			if useHash && !l.IsDir && !r.IsDir && l.Hash != "" && r.Hash != "" && l.Hash == r.Hash {
 				break
 			}
+			// Same size and the same sub-second mtime: one side is a copy of
+			// the other (transfers preserve mtime), e.g. after the base was
+			// lost. Backing up an identical file is pure noise.
+			if sameCopy(l, r) {
+				break
+			}
 			if l.Mtime >= r.Mtime {
 				// Local wins (newer or tie).
 				if l.IsDir {
@@ -251,6 +258,9 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 				// Both changed — conflict.
 				if l.IsDir && r.IsDir {
 					break // Dir-vs-dir, no file content conflict.
+				}
+				if sameCopy(l, r) {
+					break // both sides moved to the same file: already in sync
 				}
 				if l.Mtime >= r.Mtime {
 					actions = append(actions, Action{Op: OpPush, Path: p, Reason: "conflict: local newer or tie", Conflict: true})
@@ -399,6 +409,21 @@ func Plan(base map[string]BaseEntry, local, remote map[string]Entry, useHash boo
 	}
 
 	return sortActions(actions)
+}
+
+// sameCopy reports whether two file entries are copies of one another: equal
+// hashes when both carry one, otherwise the same size and the same mtime to
+// the nanosecond with a non-zero sub-second part. Transfers preserve mtime, so
+// independent writes essentially never share one. Whole-second mtimes (GNU tar,
+// FAT, old rsync) are too coarse to trust and still count as a conflict.
+func sameCopy(l, r Entry) bool {
+	if l.IsDir || r.IsDir {
+		return false
+	}
+	if l.Hash != "" && r.Hash != "" {
+		return l.Hash == r.Hash
+	}
+	return l.Size == r.Size && l.Mtime == r.Mtime && l.Mtime%int64(time.Second) != 0
 }
 
 // fileModified reports whether e differs from the recorded base (bSize, bMtime, bHash).
